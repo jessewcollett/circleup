@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
+import { GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult } from 'firebase/auth';
 import { auth } from '../firebase'; // Import auth from project root
 import Spinner from './Spinner';
 
@@ -9,17 +9,49 @@ export const LoginPage = () => {
   const handleGoogleLogin = async () => {
     setLoading(true);
     const provider = new GoogleAuthProvider();
-
     try {
+      // Try popup first (best UX). If popup is blocked (common in new/incognito browsers),
+      // fall back to redirect which is more reliable.
       const result = await signInWithPopup(auth, provider);
-      console.log('Logged in user:', result.user);
-    } catch (error) {
-      console.error('Login failed:', error);
-      alert('Login failed. Please try again.');
+      console.log('Logged in user (popup):', result.user);
+    } catch (error: any) {
+      console.error('Popup sign-in failed:', error);
+      // If the error indicates popup was blocked or closed, fallback to redirect
+      const code = error?.code || '';
+      if (code.includes('popup') || code === 'auth/popup-blocked' || code === 'auth/popup-closed-by-user') {
+        try {
+          await signInWithRedirect(auth, provider);
+          // redirect will take over; no need to setLoading(false) here
+          return;
+        } catch (err2) {
+          console.error('Redirect sign-in also failed:', err2);
+          alert('Login failed. Please try again.');
+        }
+      } else {
+        alert('Login failed. Please try again.');
+      }
     } finally {
       setLoading(false);
     }
   };
+
+  // If we used redirect flow, handle the result when the page loads
+  React.useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const result = await getRedirectResult(auth);
+        if (!mounted) return;
+        if (result && result.user) {
+          console.log('Logged in user (redirect):', result.user);
+        }
+      } catch (err) {
+        // It's normal to get no-redirect-result; only log unexpected errors
+        console.debug('No redirect result or redirect handling error:', err);
+      }
+    })();
+    return () => { mounted = false; };
+  }, []);
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-100 dark:bg-gray-900 p-4">
