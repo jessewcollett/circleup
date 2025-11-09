@@ -2,6 +2,7 @@
 import { initializeApp } from "firebase/app";
 import { getAnalytics } from "firebase/analytics";
 import { getAuth } from 'firebase/auth';
+import { getFirestore, enableIndexedDbPersistence } from 'firebase/firestore';
 // TODO: Add SDKs for Firebase products that you want to use
 // https://firebase.google.com/docs/web/setup#available-libraries
 
@@ -21,3 +22,10 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const analytics = getAnalytics(app);
 export const auth = getAuth(app);
+export const db = getFirestore(app);
+
+// Try to enable IndexedDB persistence for offline support; ignore errors if not possible
+enableIndexedDbPersistence(db).catch((err) => {
+  // Typical errors: failed-precondition (multiple tabs open) or unimplemented (browser)
+  console.warn('IndexedDB persistence not enabled:', err?.code || err?.message || err);
+});

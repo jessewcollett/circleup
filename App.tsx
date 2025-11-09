@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { auth } from './firebase'; // Imports your firebase.ts file
 import { LoginPage } from './components/LoginPage'; // Imports your new login page
@@ -16,6 +16,7 @@ import PastConnections from './components/PastConnections';
 import SwipeableListItem from './components/SwipeableListItem';
 import InfoModal from './components/InfoModal';
 import Spinner from './components/Spinner';
+import { migrateLocalToCloud, startRealtimeSync } from './lib/firestoreSync';
 
 type Tab = 'dashboard' | 'people' | 'groups' | 'activities' | 'ask-a-friend';
 
@@ -73,11 +74,47 @@ function App() {
   const [isPinnedReorderMode, setIsPinnedReorderMode] = useState(false);
   // This will be inside your App function
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const syncUnsubRef = useRef<(() => void)[] | null>(null);
   useEffect(() => {
     // This listener checks for login/logout
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       setCurrentUser(user); // user will be null if logged out
       setLoading(false); // We're done checking, so stop loading
+
+      // If user signed in, immediately migrate local data to cloud (aggressive sync)
+      // and start realtime listeners so changes sync between devices.
+      (async () => {
+        // Clean up any previous listeners
+        if (syncUnsubRef.current) {
+          syncUnsubRef.current.forEach(u => u());
+          syncUnsubRef.current = null;
+        }
+
+        if (user) {
+          try {
+            await migrateLocalToCloud(user.uid);
+          } catch (err) {
+            console.error('Error migrating local data to cloud:', err);
+          }
+
+          // Start realtime listeners that will update localStorage and React state
+          const unsubscribers = startRealtimeSync(user.uid, {
+            onPeople: (items) => setPeople(items),
+            onGroups: (items) => setGroups(items),
+            onInteractions: (items) => setInteractions(items),
+            onActivities: (items) => setActivities(items),
+            onSupportRequests: (items) => setSupportRequests(items),
+            onAskHistory: (items) => setAskHistory(items),
+            onSettings: (settings) => {
+              if (settings.circles) setCircles(settings.circles);
+              if (settings.connectionTypes) setConnectionTypes(settings.connectionTypes);
+              if (settings.theme) setIsDarkMode(settings.theme === 'dark');
+            }
+          });
+
+          syncUnsubRef.current = unsubscribers;
+        }
+      })();
     });
 
     // Safety splash timer to show a short loading screen
