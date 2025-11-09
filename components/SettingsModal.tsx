@@ -1,4 +1,6 @@
 import React, { useState, useRef } from 'react';
+import { signOut } from 'firebase/auth';
+import { auth } from '../firebase';
 
 interface SettingsModalProps {
   circles: string[];
@@ -273,6 +275,28 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
             accept=".json"
             className="hidden"
           />
+        </div>
+      </div>
+
+      <div className="border-t border-gray-200 dark:border-gray-700 pt-6 mt-6">
+        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Account</h3>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">Sign out of your account on this device.</p>
+        <div className="flex space-x-2 pt-4">
+          <button
+            onClick={async () => {
+              if (!window.confirm('Are you sure you want to sign out?')) return;
+              try {
+                await signOut(auth);
+                onClose();
+              } catch (err) {
+                console.error('Sign out failed', err);
+                alert('Sign out failed. Please try again.');
+              }
+            }}
+            className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 text-sm"
+          >
+            Sign out
+          </button>
         </div>
       </div>
 
