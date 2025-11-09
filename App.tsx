@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { onAuthStateChanged, User } from 'firebase/auth';
+import { auth } from './firebase'; // Imports your firebase.ts file
+import { LoginPage } from './components/LoginPage'; // Imports your new login page
 import { Person, Group, Interaction, Activity, ModalType, SupportRequest, AskHistoryEntry } from './types';
 import { INITIAL_PEOPLE, INITIAL_GROUPS, INITIAL_INTERACTIONS, INITIAL_ACTIVITIES, DEFAULT_CIRCLES, INITIAL_SUPPORT_REQUESTS, INITIAL_ASK_HISTORY, DEFAULT_CONNECTION_TYPES } from './constants';
 import Modal from './components/Modal';
@@ -12,6 +15,7 @@ import SupportRequestForm from './components/SupportRequestForm';
 import PastConnections from './components/PastConnections';
 import SwipeableListItem from './components/SwipeableListItem';
 import InfoModal from './components/InfoModal';
+import Spinner from './components/Spinner';
 
 type Tab = 'dashboard' | 'people' | 'groups' | 'activities' | 'ask-a-friend';
 
@@ -67,13 +71,25 @@ function App() {
   // State for People tab UI
   const [collapsedCircles, setCollapsedCircles] = useState<string[]>([]);
   const [isPinnedReorderMode, setIsPinnedReorderMode] = useState(false);
-
-
+  // This will be inside your App function
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
   useEffect(() => {
+    // This listener checks for login/logout
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user); // user will be null if logged out
+      setLoading(false); // We're done checking, so stop loading
+    });
+
+    // Safety splash timer to show a short loading screen
     const timer = setTimeout(() => {
-        setLoading(false);
+      setLoading(false);
     }, 2000); // 2 seconds for splash screen
-    return () => clearTimeout(timer);
+
+    // Cleanup both the auth listener and the timer
+    return () => {
+      unsubscribe();
+      clearTimeout(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -571,15 +587,17 @@ function App() {
 
   if (loading) {
     return (
-        <div className="min-h-screen flex flex-col justify-center items-center bg-gray-100 dark:bg-gray-900 text-center p-4">
-            <h1 className="text-5xl font-bold text-blue-600 dark:text-blue-500 animate-pulse">
-                CircleUp
-            </h1>
-            <p className="mt-4 text-lg text-gray-600 dark:text-gray-400">
-                Pursue Meaningful and Active Connection to Others
-            </p>
-        </div>
+      <div className="min-h-screen flex flex-col justify-center items-center bg-gray-100 dark:bg-gray-900 text-center p-4">
+        <Spinner size={72} />
+        <h1 className="mt-6 text-5xl font-bold text-blue-600 dark:text-blue-500">CircleUp</h1>
+        <p className="mt-4 text-lg text-gray-600 dark:text-gray-400">Pursue Meaningful and Active Connection to Others</p>
+      </div>
     );
+  }
+
+  // 2. If we're done loading and there is NO user, show the LoginPage
+  if (!currentUser) {
+    return <LoginPage />;
   }
 
   return (
