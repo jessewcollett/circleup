@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { signOut } from 'firebase/auth';
 import { auth } from '../firebase';
+import { migrateLocalToCloud, pullRemoteToLocal } from '../lib/firestoreSync';
 
 interface SettingsModalProps {
   circles: string[];
@@ -268,6 +269,42 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
           >
             Import Data
           </button>
+            <button
+              onClick={async () => {
+                if (!auth.currentUser) return alert('Not signed in');
+                try {
+                  const res = await pullRemoteToLocal(auth.currentUser.uid);
+                  if (res?.success) {
+                    alert('Pulled remote data into this browser. Reloading to apply.');
+                    window.location.reload();
+                  } else {
+                    alert('Pull failed. Check console for details.');
+                  }
+                } catch (err) {
+                  console.error(err);
+                  alert('Pull failed. Check console.');
+                }
+              }}
+              className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 text-sm"
+            >
+              Pull Remote Now
+            </button>
+            <button
+              onClick={async () => {
+                if (!auth.currentUser) return alert('Not signed in');
+                if (!window.confirm('This will merge this browser local data into the cloud now. Continue?')) return;
+                try {
+                  await migrateLocalToCloud(auth.currentUser.uid);
+                  alert('Pushed local data to cloud.');
+                } catch (err) {
+                  console.error(err);
+                  alert('Push failed. Check console.');
+                }
+              }}
+              className="px-4 py-2 bg-yellow-600 text-white rounded-md hover:bg-yellow-700 text-sm"
+            >
+              Push Local Now
+            </button>
           <input
             type="file"
             ref={fileInputRef}
