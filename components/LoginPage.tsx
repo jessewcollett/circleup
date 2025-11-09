@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult } from 'firebase/auth';
-import { auth } from '../firebase'; // Import auth from project root
+import { auth } from '../firebase';
+import { migrateLocalToCloud } from '../lib/firestoreSync';
 import Spinner from './Spinner';
 
 export const LoginPage = () => {
@@ -14,6 +15,7 @@ export const LoginPage = () => {
       // fall back to redirect which is more reliable.
       const result = await signInWithPopup(auth, provider);
       console.log('Logged in user (popup):', result.user);
+      await migrateLocalToCloud(result.user.uid);
     } catch (error: any) {
       console.error('Popup sign-in failed:', error);
       // If the error indicates popup was blocked or closed, fallback to redirect
@@ -44,6 +46,7 @@ export const LoginPage = () => {
         if (!mounted) return;
         if (result && result.user) {
           console.log('Logged in user (redirect):', result.user);
+          await migrateLocalToCloud(result.user.uid);
         }
       } catch (err) {
         // It's normal to get no-redirect-result; only log unexpected errors

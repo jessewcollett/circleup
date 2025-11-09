@@ -2,7 +2,7 @@ import { db } from '../firebase';
 import { collection, doc, setDoc, getDocs, writeBatch, onSnapshot, query } from 'firebase/firestore';
 
 // Keys we use in localStorage
-const LS_KEYS = {
+export const LS_KEYS = {
   people: 'circleup_people',
   groups: 'circleup_groups',
   interactions: 'circleup_interactions',

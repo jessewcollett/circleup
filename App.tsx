@@ -817,7 +817,7 @@ function App() {
                     </div>
                  )}
 
-                 {Object.entries(peopleByCircle).map(([circle, members]) => (
+                 {Object.entries(peopleByCircle).map(([circle, members]: [string, Person[]]) => (
                     <div key={circle} className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
                         <button onClick={() => toggleCircleCollapse(circle)} className="w-full p-3 text-left flex justify-between items-center bg-gray-50 dark:bg-gray-700/50 hover:bg-gray-100 dark:hover:bg-gray-700">
                            <h3 className="text-sm font-bold uppercase text-gray-500 dark:text-gray-400">{circle}</h3>
