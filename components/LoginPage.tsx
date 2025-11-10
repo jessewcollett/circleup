@@ -1,40 +1,110 @@
 import React, { useState } from 'react';
-import { GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult } from 'firebase/auth';
-import { auth } from '../firebase';
+import { GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, signInAnonymously, signInWithCredential } from 'firebase/auth';
+import { auth, authReady, probeAnonymousSignup, FIREBASE_API_KEY } from '../firebase';
 import { migrateLocalToCloud } from '../lib/firestoreSync';
 import Spinner from './Spinner';
+import { Capacitor } from '@capacitor/core';
 
 export const LoginPage = () => {
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleGoogleLogin = async () => {
     setLoading(true);
+    setError(null);
     const provider = new GoogleAuthProvider();
     try {
-      // Try popup first (best UX). If popup is blocked (common in new/incognito browsers),
-      // fall back to redirect which is more reliable.
-      const result = await signInWithPopup(auth, provider);
-      console.log('Logged in user (popup):', result.user);
-      await migrateLocalToCloud(result.user.uid);
-    } catch (error: any) {
-      console.error('Popup sign-in failed:', error);
-      // If the error indicates popup was blocked or closed, fallback to redirect
-      const code = error?.code || '';
-      if (code.includes('popup') || code === 'auth/popup-blocked' || code === 'auth/popup-closed-by-user') {
+      if (Capacitor.isNativePlatform()) {
+        console.log('[google-login] Native platform detected; using capacitor-google-auth plugin');
+        const { GoogleAuth } = await import('@codetrix-studio/capacitor-google-auth');
         try {
-          await signInWithRedirect(auth, provider);
-          // redirect will take over; no need to setLoading(false) here
-          return;
-        } catch (err2) {
-          console.error('Redirect sign-in also failed:', err2);
-          alert('Login failed. Please try again.');
+          await GoogleAuth.initialize({ scopes: ['profile', 'email'] });
+        } catch (e) {
+          console.warn('[google-login] initialize skipped/failed (may already be initialized):', e);
         }
+        const googleUser = await GoogleAuth.signIn();
+        console.log('[google-login] Plugin returned user:', googleUser?.email);
+        const idToken = googleUser?.authentication?.idToken;
+        const accessToken = googleUser?.authentication?.accessToken;
+        if (!idToken) throw new Error('Missing idToken from native Google sign-in');
+        const credential = GoogleAuthProvider.credential(idToken, accessToken);
+        await signInWithCredential(auth, credential);
       } else {
-        alert('Login failed. Please try again.');
+        console.log('[google-login] Web platform; using signInWithPopup');
+        await signInWithPopup(auth, provider);
       }
-    } finally {
+      // Auth state listener (App.tsx) will proceed
+    } catch (error: any) {
+      console.error('[google-login] Login failed:', error);
+      setError(error?.message || 'Login failed. Please try again.');
       setLoading(false);
     }
+  };
+
+  const handleAnonymousLogin = async () => {
+    setLoading(true);
+    setError(null);
+    
+    try {
+      console.log('Waiting for authReady...');
+      // Await authReady only if not native (native path is immediate now)
+      try {
+        await Promise.race([
+          authReady,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('authReady timeout')), 5000))
+        ]);
+        console.log('authReady resolved. Starting anonymous sign-in...');
+      } catch (e) {
+        console.warn('authReady wait skipped/timeout, proceeding anyway on native');
+      }
+      console.log('Starting anonymous sign-in...');
+      console.log('Calling signInAnonymously...');
+      const startTs = Date.now();
+      let heartbeatCount = 0;
+      const heartbeat = setInterval(() => {
+        heartbeatCount++;
+        console.log(`[anon-heartbeat] ${(Date.now()-startTs)}ms elapsed, awaiting Firebase response (count=${heartbeatCount})`);
+      }, 1500);
+      
+      // Add a safety timeout so we can surface a visible error instead of hanging forever
+      const result = await Promise.race([
+        signInAnonymously(auth),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('signInAnonymously timeout after 12s')), 12000))
+      ]);
+      clearInterval(heartbeat);
+      
+      console.log('Anonymous sign-in successful:', result.user.uid);
+      setLoading(false);
+      // Auth state change in App.tsx will handle the rest
+    } catch (error: any) {
+      console.log('Anonymous sign-in failed or timed out at', Date.now());
+      console.error('Anonymous login failed:', error);
+      console.error('Error code:', error?.code);
+      console.error('Error message:', error?.message);
+      console.error('Error name:', error?.name);
+      console.error('Error stack:', error?.stack);
+      // Kick off a REST probe to check network reachability to Firebase Auth in WKWebView
+      try {
+        console.log('Probing identitytoolkit anonymous endpoint...');
+        const probe = await probeAnonymousSignup(FIREBASE_API_KEY);
+        console.log('Probe result:', probe);
+      } catch (e) {
+        console.warn('Probe failed:', e);
+      }
+      setError(`${error?.code || 'unknown'}: ${error?.message || 'Login failed'}`);
+      setLoading(false);
+    }
+  };
+
+  const handleCreateStubUser = () => {
+    // Non-persistent stub so you can test the rest of the UI while auth is investigated.
+    // We simulate a Firebase user object with just a uid and minimal fields.
+    const stubUid = `stub-${Date.now()}`;
+    console.warn('[stub-user] Creating temporary in-memory user', stubUid);
+    // @ts-ignore force assignment for testing only
+    auth.currentUser = { uid: stubUid };
+    window.dispatchEvent(new Event('circleup-stub-user')); // optional custom event
+    setLoading(false);
   };
 
   // If we used redirect flow, handle the result when the page loads
@@ -56,6 +126,8 @@ export const LoginPage = () => {
     return () => { mounted = false; };
   }, []);
 
+  const showAnonymous = false; // Disabled for production
+
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-100 dark:bg-gray-900 p-4">
       <div className="max-w-md w-full bg-white dark:bg-gray-800 rounded-lg shadow-md p-8 text-center">
@@ -64,6 +136,7 @@ export const LoginPage = () => {
 
         <div className="mt-8">
           <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">Please sign in to continue</p>
+          
           <button
             onClick={handleGoogleLogin}
             disabled={loading}

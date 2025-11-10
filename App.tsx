@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { onAuthStateChanged, User } from 'firebase/auth';
+import { onAuthStateChanged, User, signOut } from 'firebase/auth';
 import { auth } from './firebase'; // Imports your firebase.ts file
 import { LoginPage } from './components/LoginPage'; // Imports your new login page
 import { Person, Group, Interaction, Activity, ModalType, SupportRequest, AskHistoryEntry } from './types';
@@ -17,10 +17,12 @@ import SwipeableListItem from './components/SwipeableListItem';
 import InfoModal from './components/InfoModal';
 import Spinner from './components/Spinner';
 import { migrateLocalToCloud, startRealtimeSync } from './lib/firestoreSync';
+import { Capacitor } from '@capacitor/core';
 
 type Tab = 'dashboard' | 'people' | 'groups' | 'activities' | 'ask-a-friend';
 
 function App() {
+  console.log('[startup] auth.currentUser at initial render:', auth.currentUser);
   const [loading, setLoading] = useState(true);
   const [people, setPeople] = useState<Person[]>(() => {
     const saved = localStorage.getItem('circleup_people');
@@ -151,6 +153,9 @@ function App() {
   }, [isDarkMode]);
 
   const toggleDarkMode = () => setIsDarkMode(prev => !prev);
+
+  const showDebug = (import.meta as any).env?.DEV || Capacitor.isNativePlatform();
+  // Removed debug overlay - production ready
 
   const handleSavePerson = (person: Person) => {
     setPeople(prev => {
@@ -639,7 +644,7 @@ function App() {
 
   return (
     <div className="bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100 min-h-screen font-sans overflow-x-hidden">
-      <header className="bg-white dark:bg-gray-800 shadow-sm sticky top-0 z-20">
+      <header className="bg-white dark:bg-gray-800 shadow-sm sticky top-0 z-20 safe-top">
         <div className="container mx-auto px-4 py-3 flex justify-between items-center">
             <h1 className="text-2xl font-bold text-gray-800 dark:text-gray-100">CircleUp</h1>
             <div className="flex items-center space-x-2 sm:space-x-4">
