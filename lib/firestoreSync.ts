@@ -9,6 +9,7 @@ export const LS_KEYS = {
   activities: 'circleup_activities',
   circles: 'circleup_circles',
   connectionTypes: 'circleup_connectionTypes',
+  reminderLookahead: 'circleup_reminderLookahead',
   supportRequests: 'circleup_supportRequests',
   askHistory: 'circleup_askHistory',
   theme: 'circleup_theme'
@@ -93,6 +94,7 @@ export async function migrateLocalToCloud(uid: string) {
   const mergedSettings = {
     circles: local.circles || [],
     connectionTypes: local.connectionTypes || [],
+    reminderLookahead: local.reminderLookahead ?? 7,
     theme: local.theme || 'light',
     updatedAt: Date.now()
   };
@@ -141,11 +143,17 @@ export function startRealtimeSync(uid: string, handlers: {
     if (!cb) return;
     const q = query(collection(db, 'users', uid, col));
     const unsub = onSnapshot(q, async (snap) => {
+      // Ignore local echoes resulting from this client's pending writes
+      if (snap.metadata.hasPendingWrites) {
+        console.debug(`[firestoreSync] Ignoring local echo for '${col}'`);
+        return;
+      }
       const items = snap.docs.map(d => d.data());
       try {
         // update localStorage for this collection
         const key = (LS_KEYS as any)[col];
         if (key) localStorage.setItem(key, JSON.stringify(items));
+        localStorage.setItem('circleup_realtime_initialized', '1');
       } catch (e) { /* ignore */ }
       cb(items);
     });
@@ -162,16 +170,94 @@ export function startRealtimeSync(uid: string, handlers: {
   // settings (meta/settings) as a doc
   const settingsRef = doc(db, 'users', uid, 'meta', 'settings');
   const unsubSettings = onSnapshot(settingsRef, (snap) => {
+    // Ignore local echoes resulting from this client's pending writes
+    if (snap.metadata.hasPendingWrites) {
+      console.debug(`[firestoreSync] Ignoring local echo for 'settings'`);
+      return;
+    }
     if (!snap.exists()) return;
     const data = snap.data();
     try {
       localStorage.setItem(LS_KEYS.circles, JSON.stringify(data.circles || []));
       localStorage.setItem(LS_KEYS.connectionTypes, JSON.stringify(data.connectionTypes || []));
+      if (data.reminderLookahead !== undefined) localStorage.setItem(LS_KEYS.reminderLookahead, JSON.stringify(data.reminderLookahead));
       if (data.theme) localStorage.setItem(LS_KEYS.theme, data.theme);
+      localStorage.setItem('circleup_realtime_initialized', '1');
     } catch (e) {}
     handlers.onSettings?.(data);
   });
   unsubscribers.push(unsubSettings);
 
   return unsubscribers;
+}
+
+// Write-through sync: write the provided state to Firestore using a single batch.
+// This function does not read from Firestore and aims to be idempotent.
+export async function syncStateToCloud(uid: string, state: {
+  people?: any[];
+  groups?: any[];
+  interactions?: any[];
+  activities?: any[];
+  supportRequests?: any[];
+  askHistory?: any[];
+  settings?: any;
+}) {
+  if (!uid) return;
+  const batch = writeBatch(db);
+
+  const upsertCollection = (col: string, items: any[] | undefined) => {
+    if (!items || !Array.isArray(items)) return;
+    for (const it of items) {
+      const id = (it && it.id) ? String(it.id) : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const ref = doc(db, 'users', uid, col, id);
+      // Use merge to avoid overwriting fields unintentionally
+      batch.set(ref, { ...it, id }, { merge: true });
+    }
+  };
+
+  // Optionally delete docs that are no longer present locally.
+  // Only perform deletes after realtime has initialized to avoid blowing away server source-of-truth on first load.
+  const maybeDeleteMissing = (col: string, items: any[] | undefined) => {
+    try {
+      const initialized = localStorage.getItem('circleup_realtime_initialized') === '1';
+      if (!initialized) return;
+      const key = (LS_KEYS as any)[col];
+      if (!key) return;
+      const remoteJson = localStorage.getItem(key);
+      const remoteItems: any[] = remoteJson ? JSON.parse(remoteJson) : [];
+      const remoteIds = new Set(remoteItems.filter(Boolean).map(it => String(it.id)));
+      const localIds = new Set((items || []).filter(Boolean).map(it => String(it.id)));
+      for (const rid of remoteIds) {
+        if (!localIds.has(rid)) {
+          const ref = doc(db, 'users', uid, col, rid);
+          batch.delete(ref);
+        }
+      }
+    } catch { /* ignore */ }
+  };
+
+  upsertCollection('people', state.people);
+  maybeDeleteMissing('people', state.people);
+  upsertCollection('groups', state.groups);
+  maybeDeleteMissing('groups', state.groups);
+  upsertCollection('interactions', state.interactions);
+  maybeDeleteMissing('interactions', state.interactions);
+  upsertCollection('activities', state.activities);
+  maybeDeleteMissing('activities', state.activities);
+  upsertCollection('supportRequests', state.supportRequests);
+  maybeDeleteMissing('supportRequests', state.supportRequests);
+  upsertCollection('askHistory', state.askHistory);
+  maybeDeleteMissing('askHistory', state.askHistory);
+
+  if (state.settings && typeof state.settings === 'object') {
+    const settingsRef = doc(db, 'users', uid, 'meta', 'settings');
+    batch.set(settingsRef, { ...state.settings }, { merge: true });
+  }
+
+  try {
+    await batch.commit();
+    console.debug('[firestoreSync] syncStateToCloud: batch committed');
+  } catch (e) {
+    console.error('[firestoreSync] syncStateToCloud failed:', e);
+  }
 }

@@ -29,6 +29,7 @@ const ActivityIdeaForm: React.FC<ActivityIdeaFormProps> = ({ people, groups, onC
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [ideaType, setIdeaType] = useState<IdeaType>('Activity');
   const [customPrompt, setCustomPrompt] = useState('');
+  const [location, setLocation] = useState('');
   const [result, setResult] = useState<string>('');
   const [sources, setSources] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -101,6 +102,7 @@ const ActivityIdeaForm: React.FC<ActivityIdeaFormProps> = ({ people, groups, onC
 
         **Request:**
         Generate ideas for: ${ideaType}
+        Location: ${location || 'No specific location provided'}
         ${customPrompt ? `Additional context: ${customPrompt}` : ''}
       `;
       
@@ -145,54 +147,77 @@ const ActivityIdeaForm: React.FC<ActivityIdeaFormProps> = ({ people, groups, onC
   }, [people, circles]);
 
   return (
-    <div className="space-y-4">
-      <div>
-        <label htmlFor="ideaType" className="block text-sm font-medium text-gray-700 dark:text-gray-300">What do you need ideas for?</label>
-        <select id="ideaType" value={ideaType} onChange={(e) => setIdeaType(e.target.value as IdeaType)} className="mt-1 input-field">
-          <option>Activity</option>
-          <option>Gift</option>
-          <option>Food Recommendation</option>
-        </select>
+    <div className="space-y-3">
+      <div className="space-y-3">
+        <div>
+          <label htmlFor="ideaType" className="form-label">What do you need ideas for?</label>
+          <select
+            id="ideaType"
+            value={ideaType}
+            onChange={(e) => setIdeaType(e.target.value as IdeaType)}
+            className="input-field"
+          >
+            <option value="">Select type...</option>
+            <option value="Activity">Activity</option>
+            <option value="Food Recommendation">Food Recommendation</option>
+            <option value="Gift">Gift</option>
+          </select>
+        </div>
+
+        {(ideaType === 'Activity' || ideaType === 'Food Recommendation') && (
+          <div className="animate-fadeIn">
+            <label htmlFor="location" className="form-label">Where should we look for ideas?</label>
+            <input
+              type="text"
+              id="location"
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              placeholder="e.g., San Francisco, CA"
+              className="input-field"
+            />
+          </div>
+        )}
       </div>
 
-       <div>
-        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Who is this for? ("Me" is included by default)</label>
-        <div className="mt-2 max-h-40 overflow-y-auto border border-gray-300 dark:border-gray-600 rounded-md p-2 space-y-1">
-            {Object.entries(groupedPeople).map(([circle, members]) => (
-                <div key={circle}>
-                    <h4 className="font-semibold text-xs uppercase text-gray-500 dark:text-gray-400 py-1 sticky top-0 bg-white/80 dark:bg-gray-800/80 backdrop-blur-sm">{circle}</h4>
-                    {members.map(person => (
-                        <div key={person.id} className="flex items-center pl-2 py-0.5">
-                            <input id={`ai-p-${person.id}`} type="checkbox" checked={selectedIds.includes(person.id)} onChange={() => handleToggle(person.id)} className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" />
-                            <label htmlFor={`ai-p-${person.id}`} className="ml-3 block text-sm text-gray-900 dark:text-gray-100">{person.name}</label>
-                        </div>
-                    ))}
-                </div>
-            ))}
-             {groups.length > 0 && <h4 className="font-semibold text-xs uppercase text-gray-500 dark:text-gray-400 pt-2 sticky top-0 bg-white/80 dark:bg-gray-800/80 backdrop-blur-sm">Groups</h4>}
+       <div className="form-section-tight">
+        <label className="form-label">Who is this for? ("Me" is included by default)</label>
+        <div className="form-scroll-box mt-1 max-h-40">
+            {Object.entries(groupedPeople).map(([circle, members]) => {
+                const list = members as Person[];
+                return (
+                  <div key={circle}>
+                      <h4 className="form-sticky-header">{circle}</h4>
+                      {list.map(person => (
+                          <div key={person.id} className="flex items-center pl-1 py-0.5">
+                              <input id={`ai-p-${person.id}`} type="checkbox" checked={selectedIds.includes(person.id)} onChange={() => handleToggle(person.id)} className="h-3.5 w-3.5 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" />
+                              <label htmlFor={`ai-p-${person.id}`} className="ml-2 block text-xs text-gray-900 dark:text-gray-100">{person.name}</label>
+                          </div>
+                      ))}
+                  </div>
+                );
+            })}
+             {groups.length > 0 && <h4 className="form-sticky-header pt-1">Groups</h4>}
             {groups.map(group => (
-                 <div key={group.id} className="flex items-center pl-2 py-0.5">
-                    <input id={`ai-g-${group.id}`} type="checkbox" checked={selectedIds.includes(group.id)} onChange={() => handleToggle(group.id)} className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" />
-                    <label htmlFor={`ai-g-${group.id}`} className="ml-3 block text-sm text-gray-900 dark:text-gray-100">{group.name}</label>
+                 <div key={group.id} className="flex items-center pl-1 py-0.5">
+                    <input id={`ai-g-${group.id}`} type="checkbox" checked={selectedIds.includes(group.id)} onChange={() => handleToggle(group.id)} className="h-3.5 w-3.5 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" />
+                    <label htmlFor={`ai-g-${group.id}`} className="ml-2 block text-xs text-gray-900 dark:text-gray-100">{group.name}</label>
                 </div>
             ))}
         </div>
       </div>
       
       <div>
-        <label htmlFor="customPrompt" className="block text-sm font-medium text-gray-700 dark:text-gray-300">Additional Details (optional)</label>
-        <input type="text" id="customPrompt" value={customPrompt} onChange={(e) => setCustomPrompt(e.target.value)} placeholder="e.g., for a birthday, near downtown" className="mt-1 input-field" />
+        <label htmlFor="customPrompt" className="form-label">Additional Details (optional)</label>
+        <input type="text" id="customPrompt" value={customPrompt} onChange={(e) => setCustomPrompt(e.target.value)} placeholder="e.g., for a birthday, near downtown" className="input-field" />
       </div>
       
-      <div className="flex justify-end pt-2">
-        <button onClick={generateIdeas} disabled={isLoading || selectedIds.length === 0} className="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:bg-gray-400">
+      <div className="flex justify-end pt-1">
+        <button onClick={generateIdeas} disabled={isLoading || selectedIds.length === 0} className="px-3 py-1.5 bg-purple-600 text-white text-sm rounded-md hover:bg-purple-700 disabled:bg-gray-400">
             {isLoading ? 'Generating...' : 'Get Ideas'}
         </button>
       </div>
 
-      {error && <p className="text-red-500 text-sm mt-2">{error}</p>}
-
-      {result && (
+      {error && <p className="form-error">{error}</p>}      {result && (
         <div className="mt-4 p-4 bg-gray-50 dark:bg-gray-700 rounded-md">
             <h3 className="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-2">Suggestions</h3>
              <SimpleMarkdownRenderer content={result} />
@@ -212,9 +237,7 @@ const ActivityIdeaForm: React.FC<ActivityIdeaFormProps> = ({ people, groups, onC
             )}
         </div>
       )}
-      <style>{`.input-field { display: block; width: 100%; min-width: 0; padding: 0.5rem 0.75rem; background-color: white; border: 1px solid #D1D5DB; border-radius: 0.375rem; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); font-size: 1rem; color: #111827; } .dark .input-field { background-color: #374151; border-color: #4B5563; color: #F9FAFB; } .dark .input-field:focus { outline: none; ring: 2px; ring-color: #3B82F6; border-color: #3B82F6; }`}</style>
+      {/* Global .input-field + .animate-fadeIn styles now centralized in index.css */}
     </div>
   );
-};
-
-export default ActivityIdeaForm;
+};export default ActivityIdeaForm;

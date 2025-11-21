@@ -2,6 +2,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+console.log('[bootstrap] index.tsx loaded');
 
 const rootElement = document.getElementById('root');
 if (!rootElement) {
@@ -9,8 +10,10 @@ if (!rootElement) {
 }
 
 const root = ReactDOM.createRoot(rootElement);
+console.log('[bootstrap] React root created');
 root.render(
   <React.StrictMode>
     <App />
   </React.StrictMode>
 );
+console.log('[bootstrap] React render called');

@@ -1,0 +1,46 @@
+{
+  "project_info": {
+    "project_number": "1031944311075",
+    "project_id": "circleup-bdd94",
+    "storage_bucket": "circleup-bdd94.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1031944311075:android:1588fc89bc601edc987c96",
+        "android_client_info": {
+          "package_name": "com.collettcollc.circleup"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1031944311075-pf9u880u296pkuopt46uugjgdalp9v0c.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCLVJEWNxuTENyNq6GvGWIGQjEH6uPcSi0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1031944311075-pf9u880u296pkuopt46uugjgdalp9v0c.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "1031944311075-cmthb2ka9ojm4fku272v78n7bv5kenv9.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.circleup.app"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

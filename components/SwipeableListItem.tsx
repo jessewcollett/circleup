@@ -114,10 +114,18 @@ const SwipeableListItem: React.FC<SwipeableListItemProps> = ({
       // If an action was triggered, execute it after the animation
       if (action) {
         setTimeout(() => {
-            action?.();
+          action?.();
+          // Snap back after action
+          element.style.transition = 'transform 0.25s ease-out';
+          element.style.transform = 'translateX(0px)';
         }, 250);
+      } else {
+        // If no action, snap back immediately
+        setTimeout(() => {
+          element.style.transition = 'transform 0.25s ease-out';
+          element.style.transform = 'translateX(0px)';
+        }, 10);
       }
-      
       currentTranslateX.current = 0; // Reset for next interaction
     };
 

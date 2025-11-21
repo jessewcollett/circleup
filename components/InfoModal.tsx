@@ -1,6 +1,10 @@
 import React from 'react';
 
-const InfoModal: React.FC = () => {
+interface InfoModalProps {
+  onReplayTour?: () => void;
+}
+
+const InfoModal: React.FC<InfoModalProps> = ({ onReplayTour }) => {
     
   const Section: React.FC<{title: string, children: React.ReactNode}> = ({ title, children }) => (
     <div>
@@ -47,6 +51,19 @@ const InfoModal: React.FC = () => {
           </li>
         </ul>
       </Section>
+
+      <div className="pt-2 border-t border-gray-200 dark:border-gray-700">
+        <button
+          type="button"
+          onClick={() => {
+            if (onReplayTour) onReplayTour();
+            else window.dispatchEvent(new Event('circleup:startOnboarding'));
+          }}
+          className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm font-medium"
+        >
+          Take a Tour
+        </button>
+      </div>
     </div>
   );
 };

@@ -1,0 +1,47 @@
+require_relative '../../node_modules/@capacitor/ios/scripts/pods_helpers'
+
+platform :ios, '14.0'
+use_frameworks!
+
+# Removed legacy disable_input_output_paths workaround to allow CocoaPods to generate proper
+# input/output xcfilelists for the Embed Pods Frameworks phase (required for Xcode sandbox compatibility).
+
+def capacitor_pods
+  pod 'Capacitor', :path => '../../node_modules/@capacitor/ios'
+  pod 'CapacitorCordova', :path => '../../node_modules/@capacitor/ios'
+  pod 'CapacitorBrowser', :path => '../../node_modules/@capacitor/browser'
+  pod 'CapacitorClipboard', :path => '../../node_modules/@capacitor/clipboard'
+  pod 'CapacitorShare', :path => '../../node_modules/@capacitor/share'
+  pod 'GoogleSignIn'
+end
+
+target 'App' do
+  capacitor_pods
+  # Add your Pods here
+end
+
+post_install do |installer|
+  assertDeploymentTarget(installer)
+  # Xcode 15/16's VerifyModule is strict about quoted includes in framework headers
+  # (e.g., GTMAppAuth, GTMSessionFetcher). Relax the warning and ensure header
+  # search paths are present so VerifyModule can see transitive headers.
+  pods_to_relax = [
+    'CapacitorCordova', 'Capacitor',
+    'GTMAppAuth', 'GTMSessionFetcher', 'GoogleSignIn', 'AppAuth'
+  ]
+
+  installer.pods_project.targets.each do |t|
+    next unless pods_to_relax.include?(t.name)
+    t.build_configurations.each do |config|
+      settings = config.build_settings
+      settings['CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER'] = 'NO'
+      settings['CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES'] = 'YES'
+      # Also pass the flag to ensure it's not treated as error in some environments
+      settings['OTHER_CFLAGS'] = "$(inherited) -Wno-quoted-include-in-framework-header"
+      # Make sure GTMSessionFetcher public headers are discoverable during verification
+      header_search = settings['HEADER_SEARCH_PATHS'] || '$(inherited)'
+      header_search << ' "${PODS_ROOT}/Headers/Public/GTMSessionFetcher"'
+      settings['HEADER_SEARCH_PATHS'] = header_search
+    end
+  end
+end
