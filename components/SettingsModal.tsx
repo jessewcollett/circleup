@@ -1,14 +1,21 @@
 import React, { useState, useRef } from 'react';
 import { signOut } from 'firebase/auth';
-import { auth } from '../firebase';
+import { auth, db } from '../firebase';
 import { migrateLocalToCloud, pullRemoteToLocal } from '../lib/firestoreSync';
+import { testFirestore } from '../lib/firestoreTest';
+import { collection, query, getDocs, writeBatch, deleteDoc, doc } from 'firebase/firestore';
 
 interface SettingsModalProps {
   circles: string[];
   setCircles: React.Dispatch<React.SetStateAction<string[]>>;
   connectionTypes: string[];
   setConnectionTypes: React.Dispatch<React.SetStateAction<string[]>>;
+  reminderLookahead: number;
+  setReminderLookahead: React.Dispatch<React.SetStateAction<number>>;
   onClose: () => void;
+  onManualSync?: () => void;
+  lastSyncAt?: number | null;
+  onReplayTour?: () => void;
 }
 
 const ReorderableList: React.FC<{
@@ -37,20 +44,18 @@ const ReorderableList: React.FC<{
       {items.map((item, index) => (
         <li 
           key={item} 
-          className="flex justify-between items-center bg-gray-100 dark:bg-gray-700 p-2 rounded-md"
+          className={`flex justify-between items-center bg-gray-100 dark:bg-gray-700 rounded-md ${isReorderMode ? 'p-2' : 'py-1 px-2'}`}
         >
           <div className="flex items-center gap-2">
-             {isReorderMode ? (
+             {isReorderMode && (
                 <div className="flex flex-col">
                     <button onClick={() => handleMove(index, 'up')} disabled={index === 0} className="p-1 text-gray-500 hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed">
                         <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 15l7-7 7 7" /></svg>
                     </button>
                     <button onClick={() => handleMove(index, 'down')} disabled={index === items.length - 1} className="p-1 text-gray-500 hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed">
-                         <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>
                     </button>
                 </div>
-             ) : (
-                <div className="w-8 h-12"></div> // Placeholder for alignment
              )}
              <span className="text-sm">{item}</span>
           </div>
@@ -70,12 +75,86 @@ const ReorderableList: React.FC<{
   );
 }
 
-const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, connectionTypes, setConnectionTypes, onClose }) => {
+const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, connectionTypes, setConnectionTypes, reminderLookahead, setReminderLookahead, onClose, onManualSync, lastSyncAt, onReplayTour }) => {
+  const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+
+  const handleNotificationToggle = async () => {
+    if (!notificationsEnabled) {
+      // Request notification permission when toggled on
+      const permission = await Notification.requestPermission();
+      if (permission === 'granted') {
+        setNotificationsEnabled(true);
+        // Optionally trigger token registration logic here
+      } else {
+        setNotificationsEnabled(false);
+        alert('Notifications permission was denied.');
+      }
+    } else {
+      setNotificationsEnabled(false);
+      // Optionally handle disabling notifications
+    }
+  };
   const [newCircle, setNewCircle] = useState('');
   const [newConnectionType, setNewConnectionType] = useState('');
   const [isCirclesReorderMode, setIsCirclesReorderMode] = useState(false);
   const [isConnectionTypesReorderMode, setIsConnectionTypesReorderMode] = useState(false);
+  const [circlesExpanded, setCirclesExpanded] = useState(false);
+  const [connectionTypesExpanded, setConnectionTypesExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleResetData = async () => {
+    if (!window.confirm('⚠️ WARNING: This will permanently delete ALL your data from both cloud storage and this device. This action cannot be undone. Are you sure?')) {
+      return;
+    }
+    
+    if (!window.confirm('⚠️ DOUBLE CHECK: Are you absolutely sure? All your connections, groups, and history will be deleted.')) {
+      return;
+    }
+
+    const uid = auth.currentUser?.uid;
+    if (!uid) {
+      setError('Please sign in to reset data');
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    
+    try {
+      // Clear cloud data
+      const collections = ['people', 'groups', 'interactions', 'activities', 'supportRequests', 'askHistory'];
+      const batch = writeBatch(db);
+      
+      for (const col of collections) {
+        const q = query(collection(db, 'users', uid, col));
+        const snap = await getDocs(q);
+        snap.docs.forEach(d => {
+          batch.delete(doc(db, 'users', uid, col, d.id));
+        });
+      }
+      
+      // Also clear settings
+      const settingsRef = doc(db, 'users', uid, 'meta', 'settings');
+      batch.delete(settingsRef);
+      
+      await batch.commit();
+
+      // Clear local storage except for theme
+      const theme = localStorage.getItem('circleup_theme');
+      localStorage.clear();
+      if (theme) localStorage.setItem('circleup_theme', theme);
+
+      alert('All data has been reset! The app will reload.');
+      window.location.reload();
+    } catch (err) {
+      console.error('Error resetting data:', err);
+      setError('Failed to reset data. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleAddCircle = () => {
     if (newCircle.trim() && !circles.find(c => c.toLowerCase() === newCircle.trim().toLowerCase())) {
@@ -194,124 +273,203 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
   return (
     <div className="space-y-6">
       <div>
-        <div className="flex justify-between items-center">
-            <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Manage Circles</h3>
-            <button
-                onClick={() => setIsCirclesReorderMode(!isCirclesReorderMode)}
-                className="px-2 py-1 text-xs font-semibold text-white bg-blue-500 rounded-md hover:bg-blue-600"
-            >
-                {isCirclesReorderMode ? 'Done' : 'Reorder'}
-            </button>
-        </div>
-        <ReorderableList items={circles} setItems={setCircles} onDelete={handleDeleteCircle} label="circle" isReorderMode={isCirclesReorderMode} />
-        {circles.length === 0 && <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">No circles yet. Add one below!</p>}
-        <div className="flex space-x-2 pt-2">
-            <input
-            type="text"
-            value={newCircle}
-            onChange={(e) => setNewCircle(e.target.value)}
-            placeholder="New circle name"
-            className="input-field flex-grow"
-            />
-            <button
-            onClick={handleAddCircle}
-            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
-            >
-            Add
-            </button>
-        </div>
-      </div>
-      
-      <div>
-        <div className="flex justify-between items-center">
-            <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Manage Connection Types</h3>
-            <button
-                onClick={() => setIsConnectionTypesReorderMode(!isConnectionTypesReorderMode)}
-                className="px-2 py-1 text-xs font-semibold text-white bg-blue-500 rounded-md hover:bg-blue-600"
-            >
-                {isConnectionTypesReorderMode ? 'Done' : 'Reorder'}
-            </button>
-        </div>
-        <ReorderableList items={connectionTypes} setItems={setConnectionTypes} onDelete={handleDeleteConnectionType} label="connection type" isReorderMode={isConnectionTypesReorderMode}/>
-        {connectionTypes.length === 0 && <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">No connection types yet. Add one below!</p>}
-        <div className="flex space-x-2 pt-2">
-            <input
-            type="text"
-            value={newConnectionType}
-            onChange={(e) => setNewConnectionType(e.target.value)}
-            placeholder="New connection type"
-            className="input-field flex-grow"
-            />
-            <button
-            onClick={handleAddConnectionType}
-            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
-            >
-            Add
-            </button>
+        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Reminder Settings</h3>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+          Configure how far ahead you want to see upcoming reminders and events.
+        </p>
+        <div className="mt-4">
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+            Days ahead to show: {reminderLookahead}
+          </label>
+          <input
+            type="range"
+            min="1"
+            max="30"
+            value={reminderLookahead}
+            onChange={(e) => setReminderLookahead(Number(e.target.value))}
+            className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-lg appearance-none cursor-pointer"
+          />
+          <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400 mt-1">
+            <span>1 day</span>
+            <span>30 days</span>
+          </div>
         </div>
       </div>
 
+      <div className="border-t border-gray-200 dark:border-gray-700 pt-6">
+        <button
+          onClick={() => setCirclesExpanded(!circlesExpanded)}
+          className="w-full flex justify-between items-center text-lg font-medium text-gray-900 dark:text-gray-100 hover:text-blue-600 dark:hover:text-blue-400"
+        >
+          <span>Manage Circles</span>
+          <svg
+            className={`w-5 h-5 transition-transform ${circlesExpanded ? 'rotate-180' : ''}`}
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+        
+        {circlesExpanded && (
+          <div className="mt-4">
+            <div className="flex justify-end mb-2">
+              <button
+                onClick={() => setIsCirclesReorderMode(!isCirclesReorderMode)}
+                className="px-2 py-1 text-xs font-semibold text-white bg-blue-500 rounded-md hover:bg-blue-600"
+              >
+                {isCirclesReorderMode ? 'Done' : 'Reorder'}
+              </button>
+            </div>
+            <ReorderableList items={circles} setItems={setCircles} onDelete={handleDeleteCircle} label="circle" isReorderMode={isCirclesReorderMode} />
+            {circles.length === 0 && <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">No circles yet. Add one below!</p>}
+            <div className="flex space-x-2 pt-2">
+              <input
+                type="text"
+                value={newCircle}
+                onChange={(e) => setNewCircle(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleAddCircle()}
+                placeholder="New circle name"
+                className="input-field flex-grow"
+              />
+              <button
+                onClick={handleAddCircle}
+                className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+      
+      <div className="border-t border-gray-200 dark:border-gray-700 pt-6">
+        <button
+          onClick={() => setConnectionTypesExpanded(!connectionTypesExpanded)}
+          className="w-full flex justify-between items-center text-lg font-medium text-gray-900 dark:text-gray-100 hover:text-blue-600 dark:hover:text-blue-400"
+        >
+          <span>Manage Connection Types</span>
+          <svg
+            className={`w-5 h-5 transition-transform ${connectionTypesExpanded ? 'rotate-180' : ''}`}
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+        
+        {connectionTypesExpanded && (
+          <div className="mt-4">
+            <div className="flex justify-end mb-2">
+              <button
+                onClick={() => setIsConnectionTypesReorderMode(!isConnectionTypesReorderMode)}
+                className="px-2 py-1 text-xs font-semibold text-white bg-blue-500 rounded-md hover:bg-blue-600"
+              >
+                {isConnectionTypesReorderMode ? 'Done' : 'Reorder'}
+              </button>
+            </div>
+            <ReorderableList items={connectionTypes} setItems={setConnectionTypes} onDelete={handleDeleteConnectionType} label="connection type" isReorderMode={isConnectionTypesReorderMode}/>
+            {connectionTypes.length === 0 && <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">No connection types yet. Add one below!</p>}
+            <div className="flex space-x-2 pt-2">
+              <input
+                type="text"
+                value={newConnectionType}
+                onChange={(e) => setNewConnectionType(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleAddConnectionType()}
+                placeholder="New connection type"
+                className="input-field flex-grow"
+              />
+              <button
+                onClick={handleAddConnectionType}
+                className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
       <div className="border-t border-gray-200 dark:border-gray-700 pt-6 mt-6">
-        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Data Backup & Restore</h3>
+      <div className="border-t border-gray-200 dark:border-gray-700 pt-6 mt-6">
+        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Notifications</h3>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">Enable push notifications for reminders and updates.</p>
+        <div className="pt-4">
+          <label className="flex items-center gap-3 cursor-pointer select-none">
+            <span className="text-sm font-medium">Enable Notifications</span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={notificationsEnabled}
+              onClick={handleNotificationToggle}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${notificationsEnabled ? 'bg-blue-600' : 'bg-gray-300'}`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform duration-200 ${notificationsEnabled ? 'translate-x-5' : 'translate-x-1'}`}
+              />
+            </button>
+          </label>
+        </div>
+      </div>
+        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Data Management</h3>
         <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-          Save all your app data to a file on your device, or restore it from a backup. This is useful for transferring data between devices.
+          Manage your app data, including backup, restore, and reset options.
         </p>
-        <div className="flex space-x-2 pt-4">
+        <div className="grid grid-cols-1 gap-4 pt-4">
           <button
-            onClick={handleExport}
-            className="px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 text-sm"
+            onClick={handleResetData}
+            className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 text-sm font-medium w-full"
           >
-            Export All Data
+            Reset All Data
           </button>
-          <button
-            onClick={handleImportClick}
-            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm"
-          >
-            Import Data
-          </button>
+
+          <div className="flex space-x-2">
             <button
-              onClick={async () => {
-                if (!auth.currentUser) return alert('Not signed in');
-                try {
-                  const res = await pullRemoteToLocal(auth.currentUser.uid);
-                  if (res?.success) {
-                    alert('Pulled remote data into this browser. Reloading to apply.');
-                    window.location.reload();
-                  } else {
-                    alert('Pull failed. Check console for details.');
-                  }
-                } catch (err) {
-                  console.error(err);
-                  alert('Pull failed. Check console.');
-                }
-              }}
-              className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 text-sm"
+              onClick={handleExport}
+              className="px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 text-sm flex-1"
             >
-              Pull Remote Now
+              Export All Data
             </button>
             <button
-              onClick={async () => {
-                if (!auth.currentUser) return alert('Not signed in');
-                if (!window.confirm('This will merge this browser local data into the cloud now. Continue?')) return;
-                try {
-                  await migrateLocalToCloud(auth.currentUser.uid);
-                  alert('Pushed local data to cloud.');
-                } catch (err) {
-                  console.error(err);
-                  alert('Push failed. Check console.');
-                }
-              }}
-              className="px-4 py-2 bg-yellow-600 text-white rounded-md hover:bg-yellow-700 text-sm"
+              onClick={handleImportClick}
+              className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm flex-1"
             >
-              Push Local Now
+              Import Data
             </button>
-          <input
-            type="file"
-            ref={fileInputRef}
-            onChange={handleFileChange}
-            accept=".json"
-            className="hidden"
-          />
+          </div>
+        </div>
+        <input
+          type="file"
+          ref={fileInputRef}
+          onChange={handleFileChange}
+          accept=".json"
+          className="hidden"
+        />
+        
+        {/* Manual Sync hidden for now */}
+        {/*
+        {onManualSync && (
+          <button onClick={onManualSync}>Manual Sync</button>
+        )}
+        */}
+      </div>
+
+      <div className="border-t border-gray-200 dark:border-gray-700 pt-6 mt-6">
+        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Onboarding</h3>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">Replay the quick tour any time.</p>
+        <div className="pt-4">
+          <button
+            type="button"
+            onClick={() => {
+              if (onReplayTour) onReplayTour();
+              else window.dispatchEvent(new Event('circleup:startOnboarding'));
+            }}
+            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm font-medium"
+          >
+            Take a Tour
+          </button>
         </div>
       </div>
 
@@ -337,7 +495,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
         </div>
       </div>
 
-       <style>{`.input-field { display: block; width: 100%; min-width: 0; padding: 0.5rem 0.75rem; background-color: white; border: 1px solid #D1D5DB; border-radius: 0.375rem; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); font-size: 1rem; color: #111827; } .dark .input-field { background-color: #374151; border-color: #4B5563; color: #F9FAFB; } .dark .input-field:focus { outline: none; ring: 2px; ring-color: #3B82F6; border-color: #3B82F6; }`}</style>
+       {/* Global .input-field styles now centralized in index.css */}
     </div>
   );
 };

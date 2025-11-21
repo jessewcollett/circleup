@@ -11,6 +11,20 @@ export interface GiftIdea {
   url?: string;
 }
 
+export interface Reminder {
+  id: string;
+  text: string;
+  date: string; // ISO date string 'YYYY-MM-DD'
+  completed?: boolean;
+}
+
+export interface CustomDate {
+  id: string;
+  description: string;
+  date: string; // ISO date string 'YYYY-MM-DD' or '--MM-DD' (year optional)
+  recurring: 'none' | 'yearly' | 'monthly';
+}
+
 export interface Person {
   id: string;
   name: string;
@@ -22,7 +36,8 @@ export interface Person {
   notes: string; // For dietary needs, etc.
   followUpTopics?: string;
   giftIdeas?: GiftIdea[];
-  birthdate?: string; // 'YYYY-MM-DD'
+  reminders?: Reminder[];
+  birthdate?: string; // 'YYYY-MM-DD' or '--MM-DD' (year optional)
   isPinned?: boolean;
   pinOrder?: number; // For custom sorting of pinned people
   isMe?: boolean;
@@ -37,6 +52,7 @@ export interface Group {
   connectionGoal: ConnectionGoal;
   lastConnection: string; // ISO date string
   anniversary?: string; // 'YYYY-MM-DD'
+  customDates?: CustomDate[];
   isPinned?: boolean;
   snoozedUntil?: string; // ISO date string
   showOnDashboard?: boolean;
@@ -87,4 +103,5 @@ export type ModalType =
   | 'add-support-request'
   | 'edit-support-request'
   | 'info'
+  | 'upgrade-account'
   | null;

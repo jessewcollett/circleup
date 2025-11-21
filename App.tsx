@@ -1,9 +1,12 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { onAuthStateChanged, User } from 'firebase/auth';
-import { auth } from './firebase'; // Imports your firebase.ts file
-import { LoginPage } from './components/LoginPage'; // Imports your new login page
+import { onAuthStateChanged, User, signOut } from 'firebase/auth';
+import { auth, db } from './firebase';
+import { deleteDoc, doc } from 'firebase/firestore';
+import { LoginPage } from './components/LoginPage';
+import LoginScreen from './components/LoginScreen';
+import OnboardingController from './components/OnboardingController';
 import { Person, Group, Interaction, Activity, ModalType, SupportRequest, AskHistoryEntry } from './types';
-import { INITIAL_PEOPLE, INITIAL_GROUPS, INITIAL_INTERACTIONS, INITIAL_ACTIVITIES, DEFAULT_CIRCLES, INITIAL_SUPPORT_REQUESTS, INITIAL_ASK_HISTORY, DEFAULT_CONNECTION_TYPES } from './constants';
+import { INITIAL_PEOPLE, INITIAL_GROUPS, INITIAL_INTERACTIONS, INITIAL_ACTIVITIES, DEFAULT_CIRCLES, INITIAL_SUPPORT_REQUESTS, INITIAL_ASK_HISTORY, DEFAULT_CONNECTION_TYPES, DEFAULT_REMINDER_LOOKAHEAD } from './constants';
 import Modal from './components/Modal';
 import PersonForm from './components/PersonForm';
 import GroupForm from './components/GroupForm';
@@ -11,20 +14,39 @@ import InteractionForm from './components/InteractionForm';
 import ActivityForm from './components/ActivityForm';
 import ActivityIdeaForm from './components/ActivityIdeaForm';
 import SettingsModal from './components/SettingsModal';
+import UpgradeAccountModal from './components/UpgradeAccountModal';
+import { migrateLocalToCloud, pullRemoteToLocal, startRealtimeSync, syncStateToCloud } from './lib/firestoreSync';
 import SupportRequestForm from './components/SupportRequestForm';
 import PastConnections from './components/PastConnections';
 import SwipeableListItem from './components/SwipeableListItem';
 import InfoModal from './components/InfoModal';
 import Spinner from './components/Spinner';
-import { migrateLocalToCloud, startRealtimeSync } from './lib/firestoreSync';
+import { useDebounce } from './hooks/useDebounce';
+import { Capacitor } from '@capacitor/core';
+import { Share } from '@capacitor/share';
+import { Clipboard } from '@capacitor/clipboard';
 
 type Tab = 'dashboard' | 'people' | 'groups' | 'activities' | 'ask-a-friend';
 
+// Guard to avoid duplicate initial render logs under React.StrictMode double invocation
+let hasLoggedInitialAuthState = false;
+
 function App() {
-  const [loading, setLoading] = useState(true);
+  if (!hasLoggedInitialAuthState) {
+    console.log('[startup] auth.currentUser at initial render:', auth.currentUser);
+    hasLoggedInitialAuthState = true;
+  }
+  // Boot sequence states: 'splash' (initial), 'auth' (show login if needed), 'ready' (main app)
+  const [bootStage, setBootStage] = useState<'splash' | 'auth' | 'ready'>('splash');
+  const [loading, setLoading] = useState(true); // retained for legacy logic (postLoginLoading etc.)
+  const [postLoginLoading, setPostLoginLoading] = useState(false);
   const [people, setPeople] = useState<Person[]>(() => {
     const saved = localStorage.getItem('circleup_people');
     return saved ? JSON.parse(saved) : INITIAL_PEOPLE;
+  });
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(() => {
+    const v = localStorage.getItem('circleup_lastSync');
+    return v ? Number(v) : null;
   });
   const [groups, setGroups] = useState<Group[]>(() => {
     const saved = localStorage.getItem('circleup_groups');
@@ -46,6 +68,10 @@ function App() {
     const saved = localStorage.getItem('circleup_connectionTypes');
     return saved ? JSON.parse(saved) : DEFAULT_CONNECTION_TYPES;
   });
+  const [reminderLookahead, setReminderLookahead] = useState<number>(() => {
+    const saved = localStorage.getItem('circleup_reminderLookahead');
+    return saved ? JSON.parse(saved) : DEFAULT_REMINDER_LOOKAHEAD;
+  });
   const [supportRequests, setSupportRequests] = useState<SupportRequest[]>(() => {
     const saved = localStorage.getItem('circleup_supportRequests');
     return saved ? JSON.parse(saved) : INITIAL_SUPPORT_REQUESTS;
@@ -63,26 +89,99 @@ function App() {
   const [editingSupportRequest, setEditingSupportRequest] = useState<SupportRequest | undefined>(undefined);
   const [loggingForItem, setLoggingForItem] = useState<{ id: string; name: string; type: 'person' | 'group' } | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
+  const [forceUpcomingRefresh, setForceUpcomingRefresh] = useState(0);
+  interface UpcomingItem {
+    id: string;
+    type: 'birthday' | 'reminder' | 'groupDate';
+    personId?: string;
+    groupId?: string;
+    date: Date;
+    displayDate: string;
+    title: string;    // primary line (e.g., Name)
+    subtitle: string; // secondary line (e.g., "32nd birthday" or reminder text)
+  }
+  const [upcomingMenuItem, setUpcomingMenuItem] = useState<UpcomingItem | null>(null);
+  
+  // Sharing state
+  interface ShareablePersonCard {
+    version: number;
+    name: string;
+    interests: string[];
+    dislikes: string[];
+    birthdate?: string;
+    giftIdeas?: { text: string; url?: string }[];
+  }
+  const [importingCard, setImportingCard] = useState<ShareablePersonCard | null>(null);
+  const [mergingCard, setMergingCard] = useState<{ 
+    card: ShareablePersonCard; 
+    existingPerson: Person;
+    mergeOptions: { interests: boolean; dislikes: boolean; birthdate: boolean; giftIdeas: boolean };
+  } | null>(null);
+  const [sharingCard, setSharingCard] = useState<{
+    interests: boolean;
+    dislikes: boolean;
+    birthdate: boolean;
+    giftIdeas: boolean;
+  } | null>(null);
+  const [manualMergeCard, setManualMergeCard] = useState<ShareablePersonCard | null>(null);
+  const [showToast, setShowToast] = useState<string | null>(null);
+  
   const [isDarkMode, setIsDarkMode] = useState(() => {
     const savedTheme = localStorage.getItem('circleup_theme');
     if (savedTheme) return savedTheme === 'dark';
-    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    // Default to dark mode if no saved theme
+    return true;
   });
   
-  // State for People tab UI
-  const [collapsedCircles, setCollapsedCircles] = useState<string[]>([]);
+  // State for People tab UI - start with all circles collapsed
+  const [collapsedCircles, setCollapsedCircles] = useState<string[]>(() => circles);
+  const [isPinnedCollapsed, setIsPinnedCollapsed] = useState(true);
   const [isPinnedReorderMode, setIsPinnedReorderMode] = useState(false);
   // This will be inside your App function
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const syncUnsubRef = useRef<(() => void)[] | null>(null);
+  
+  // Listen for onboarding navigation events
+  useEffect(() => {
+    const dashboardHandler = () => setActiveTab('dashboard');
+    const tabHandler = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail) setActiveTab(customEvent.detail as Tab);
+    };
+    const closeModalsHandler = () => setActiveModal(null);
+    
+    window.addEventListener('circleup:navigateToDashboard', dashboardHandler);
+    window.addEventListener('circleup:navigateToTab', tabHandler);
+    window.addEventListener('circleup:closeModals', closeModalsHandler);
+    
+    return () => {
+      window.removeEventListener('circleup:navigateToDashboard', dashboardHandler);
+      window.removeEventListener('circleup:navigateToTab', tabHandler);
+      window.removeEventListener('circleup:closeModals', closeModalsHandler);
+    };
+  }, []);
+  
   useEffect(() => {
     // This listener checks for login/logout
     const unsubscribe = onAuthStateChanged(auth, (user) => {
+      // If user just logged in (transitioning from null to user), show post-login loading
+      if (user && !currentUser) {
+        setPostLoginLoading(true);
+        setTimeout(() => setPostLoginLoading(false), 2000); // Show for 2 seconds after login
+      }
+      
       setCurrentUser(user); // user will be null if logged out
-      setLoading(false); // We're done checking, so stop loading
+      // When auth state resolves, if splash finished we can move to appropriate stage
+      if (bootStage === 'auth' && user) {
+        setBootStage('ready');
+      } else if (bootStage === 'auth' && !user) {
+        // Stay in 'auth' until user logs in
+      }
+      setLoading(false); // legacy flag
 
       // If user signed in, immediately migrate local data to cloud (aggressive sync)
       // and start realtime listeners so changes sync between devices.
+      // SKIP for anonymous users - they stay local-only.
       (async () => {
         // Clean up any previous listeners
         if (syncUnsubRef.current) {
@@ -90,7 +189,7 @@ function App() {
           syncUnsubRef.current = null;
         }
 
-        if (user) {
+        if (user && !user.isAnonymous) {
           try {
             await migrateLocalToCloud(user.uid);
           } catch (err) {
@@ -108,26 +207,46 @@ function App() {
             onSettings: (settings) => {
               if (settings.circles) setCircles(settings.circles);
               if (settings.connectionTypes) setConnectionTypes(settings.connectionTypes);
+              if (settings.reminderLookahead !== undefined) setReminderLookahead(settings.reminderLookahead);
               if (settings.theme) setIsDarkMode(settings.theme === 'dark');
             }
           });
 
           syncUnsubRef.current = unsubscribers;
+        } else if (user && user.isAnonymous) {
+          console.log('[guest-mode] Anonymous user detected; skipping cloud sync (local-only mode)');
         }
       })();
     });
 
-    // Safety splash timer to show a short loading screen
-    const timer = setTimeout(() => {
-      setLoading(false);
-    }, 2000); // 2 seconds for splash screen
-
-    // Cleanup both the auth listener and the timer
     return () => {
       unsubscribe();
-      clearTimeout(timer);
     };
-  }, []);
+  }, [bootStage, currentUser]);
+
+  // Splash stage controller: wait for authReady (web) + minimum duration
+  useEffect(() => {
+    const MIN_SPLASH_MS = 1200; // minimum time to show splash so UX feels intentional
+    const start = performance.now();
+    let cancelled = false;
+    (async () => {
+      // Wait for auth persistence readiness (only meaningful on web)
+      try {
+        await Promise.race([
+          (auth as any) && (window as any).Capacitor?.isNativePlatform?.() ? Promise.resolve() : (window as any).authReady || Promise.resolve(),
+          new Promise(res => setTimeout(res, 4000)) // cap wait to 4s
+        ]);
+      } catch {/* ignore */}
+      const elapsed = performance.now() - start;
+      const remaining = Math.max(0, MIN_SPLASH_MS - elapsed);
+      setTimeout(() => {
+        if (cancelled) return;
+        // If already authenticated move directly to ready, else go to auth stage (login screen)
+        setBootStage(currentUser ? 'ready' : 'auth');
+      }, remaining);
+    })();
+    return () => { cancelled = true; };
+  }, [currentUser]);
 
   useEffect(() => {
     localStorage.setItem('circleup_people', JSON.stringify(people));
@@ -136,9 +255,10 @@ function App() {
     localStorage.setItem('circleup_activities', JSON.stringify(activities));
     localStorage.setItem('circleup_circles', JSON.stringify(circles));
     localStorage.setItem('circleup_connectionTypes', JSON.stringify(connectionTypes));
+    localStorage.setItem('circleup_reminderLookahead', JSON.stringify(reminderLookahead));
     localStorage.setItem('circleup_supportRequests', JSON.stringify(supportRequests));
     localStorage.setItem('circleup_askHistory', JSON.stringify(askHistory));
-  }, [people, groups, interactions, activities, circles, connectionTypes, supportRequests, askHistory]);
+  }, [people, groups, interactions, activities, circles, connectionTypes, reminderLookahead, supportRequests, askHistory]);
 
   useEffect(() => {
     if (isDarkMode) {
@@ -187,6 +307,11 @@ function App() {
     setSupportRequests(prev => prev.map(sr => ({ ...sr, helperIds: sr.helperIds.filter(id => id !== personId) })));
     setActiveModal(null);
     setEditingPerson(undefined);
+    // Also delete from cloud so it doesn't reappear via realtime sync
+    const uid = auth.currentUser?.uid;
+    if (uid) {
+      deleteDoc(doc(db, 'users', uid, 'people', personId)).catch((e) => console.warn('Cloud delete failed (person)', e));
+    }
   }
   
   const handleTogglePin = (id: string, type: 'person' | 'group') => {
@@ -263,7 +388,8 @@ function App() {
         return [...prev, interaction];
     });
 
-    const connectionDate = new Date(interaction.date).toISOString();
+    // Parse interaction date as local date to avoid timezone shift
+    const connectionDate = parseLocalDate(interaction.date).toISOString();
     
     const peopleIdsInGroups = interaction.groupIds.flatMap(groupId => {
         const group = groups.find(g => g.id === groupId);
@@ -416,7 +542,44 @@ function App() {
   const getOverdueAmount = (item: Person | Group) => {
       return getDaysSince(item.lastConnection) - item.connectionGoal.frequency;
   }
+  // Parse a YYYY-MM-DD string as a LOCAL date (avoids UTC shifting)
+  const parseLocalDate = (ymd: string): Date => {
+    const [y, m, d] = ymd.split('-').map(v => parseInt(v, 10));
+    const dt = new Date(y, (m || 1) - 1, d || 1);
+    dt.setHours(0, 0, 0, 0);
+    return dt;
+  };
+  const formatLongDate = (date: Date): string => {
+    return date.toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  };
   
+  // Format birthdate string (--MM-DD or YYYY-MM-DD) for display without timezone issues
+  const formatBirthdateDisplay = (birthdate?: string): string => {
+    if (!birthdate) return '';
+    if (birthdate.startsWith('--')) {
+      // Format --MM-DD as "Month Day"
+      const [mm, dd] = birthdate.substring(2).split('-');
+      const month = parseInt(mm, 10);
+      const day = parseInt(dd, 10);
+      const date = new Date(2000, month - 1, day); // Use arbitrary year for formatting
+      return date.toLocaleDateString(undefined, { month: 'long', day: 'numeric' });
+    } else {
+      // Format YYYY-MM-DD using parseLocalDate to avoid timezone shift
+      const localDate = parseLocalDate(birthdate);
+      return localDate.toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' });
+    }
+  };
+  
+  // Hoisted helper for birthdays
+  function getOrdinalSuffix(num: number): string {
+    const j = num % 10;
+    const k = num % 100;
+    if (j === 1 && k !== 11) return 'st';
+    if (j === 2 && k !== 12) return 'nd';
+    if (j === 3 && k !== 13) return 'rd';
+    return 'th';
+  }
+
   const dueConnections = useMemo(() => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -430,6 +593,211 @@ function App() {
       })
       .sort((a,b) => getOverdueAmount(b) - getOverdueAmount(a));
   }, [people, groups]);
+
+  const upcomingReminders = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const lookaheadDate = new Date(today);
+    lookaheadDate.setDate(lookaheadDate.getDate() + reminderLookahead);
+
+    // Exclude items snoozed specifically in upcoming list (local only for now)
+    const dismissedRaw = localStorage.getItem('circleup_upcoming_dismissed');
+    let dismissed: Record<string,string> = {};
+    try { if (dismissedRaw) dismissed = JSON.parse(dismissedRaw); } catch {}
+    const nowTs = Date.now();
+
+    const items: UpcomingItem[] = [];
+
+    // Person birthdays and reminders
+    people.forEach(person => {
+      if (person.isMe) return;
+
+      // Birthdays
+      if (person.birthdate) {
+        const birthdateStr = person.birthdate; // already canonical '--MM-DD' or 'YYYY-MM-DD'
+        let birthDate: Date | null = null;
+        let hasYear = false;
+        try {
+          if (birthdateStr.startsWith('--')) {
+            const parts = birthdateStr.substring(2).split('-');
+            if (parts.length === 2) {
+              const [mm, dd] = parts;
+              const m = parseInt(mm,10); const d = parseInt(dd,10);
+              if (!isNaN(m) && !isNaN(d)) {
+                birthDate = new Date(today.getFullYear(), m - 1, d);
+                birthDate.setHours(0,0,0,0);
+                if (birthDate < today) {
+                  birthDate = new Date(today.getFullYear()+1, m-1, d);
+                  birthDate.setHours(0,0,0,0);
+                }
+              }
+            }
+          } else {
+            const parts = birthdateStr.split('-');
+            if (parts.length === 3) {
+              const [yyyy, mm, dd] = parts;
+              hasYear = true;
+              const m = parseInt(mm,10); const d = parseInt(dd,10);
+              if (!isNaN(m) && !isNaN(d)) {
+                birthDate = new Date(today.getFullYear(), m - 1, d);
+                birthDate.setHours(0,0,0,0);
+                if (birthDate < today) {
+                  birthDate = new Date(today.getFullYear()+1, m-1, d);
+                  birthDate.setHours(0,0,0,0);
+                }
+              }
+            }
+          }
+        } catch (e) {
+          birthDate = null;
+        }
+
+        if (birthDate && birthDate >= today && birthDate <= lookaheadDate) {
+          const birthYear = hasYear ? parseInt(birthdateStr.split('-')[0]) : null;
+          const age = birthYear ? (birthDate.getFullYear() - birthYear) : null;
+          const key = `birthday-${person.id}`;
+          if (!(dismissed[key] && parseInt(dismissed[key]) > nowTs)) {
+            items.push({
+              id: key,
+              type: 'birthday',
+              personId: person.id,
+              date: birthDate,
+              displayDate: birthDate.toLocaleDateString(),
+              title: person.name,
+              subtitle: age ? `${age}${getOrdinalSuffix(age)} birthday` : `Birthday`
+            });
+          }
+        }
+      }
+
+      // Reminders
+      (person.reminders || []).forEach(reminder => {
+        if (reminder.completed) return;
+        const reminderDate = parseLocalDate(reminder.date);
+        if (reminderDate >= today && reminderDate <= lookaheadDate) {
+          if (!(dismissed[reminder.id] && parseInt(dismissed[reminder.id]) > nowTs)) {
+            items.push({
+              id: reminder.id,
+              type: 'reminder',
+              personId: person.id,
+              date: reminderDate,
+              displayDate: reminderDate.toLocaleDateString(),
+              title: person.name,
+              subtitle: reminder.text
+            });
+          }
+        }
+      });
+    });
+
+    // Group custom dates
+    groups.forEach(group => {
+      (group.customDates || []).forEach(customDate => {
+        const dateStr = customDate.date.split('T')[0];
+        let eventDate: Date | null = null;
+
+        if (dateStr.startsWith('--')) {
+          // Format: --MM-DD (recurring yearly by default)
+          const [, month, day] = dateStr.split('-');
+          eventDate = new Date(today.getFullYear(), parseInt(month) - 1, parseInt(day));
+          eventDate.setHours(0, 0, 0, 0);
+          if (eventDate < today) {
+            eventDate = new Date(today.getFullYear() + 1, parseInt(month) - 1, parseInt(day));
+            eventDate.setHours(0, 0, 0, 0);
+          }
+        } else {
+          // Format: YYYY-MM-DD
+          const [year, month, day] = dateStr.split('-');
+          
+          if (customDate.recurring === 'yearly') {
+            eventDate = new Date(today.getFullYear(), parseInt(month) - 1, parseInt(day));
+            eventDate.setHours(0, 0, 0, 0);
+            if (eventDate < today) {
+              eventDate = new Date(today.getFullYear() + 1, parseInt(month) - 1, parseInt(day));
+              eventDate.setHours(0, 0, 0, 0);
+            }
+          } else if (customDate.recurring === 'monthly') {
+            eventDate = new Date(today.getFullYear(), today.getMonth(), parseInt(day));
+            eventDate.setHours(0, 0, 0, 0);
+            if (eventDate < today) {
+              eventDate = new Date(today.getFullYear(), today.getMonth() + 1, parseInt(day));
+              eventDate.setHours(0, 0, 0, 0);
+            }
+          } else {
+            // One-time event
+            eventDate = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+            eventDate.setHours(0, 0, 0, 0);
+          }
+        }
+
+        if (eventDate && eventDate >= today && eventDate <= lookaheadDate) {
+          if (!(dismissed[customDate.id] && parseInt(dismissed[customDate.id]) > nowTs)) {
+            items.push({
+              id: customDate.id,
+              type: 'groupDate',
+              groupId: group.id,
+              date: eventDate,
+              displayDate: eventDate.toLocaleDateString(),
+              title: group.name,
+              subtitle: customDate.description
+            });
+          }
+        }
+      });
+    });
+
+    return items.sort((a, b) => a.date.getTime() - b.date.getTime());
+  }, [people, groups, reminderLookahead, forceUpcomingRefresh]);
+
+  const dismissUpcomingItem = (id: string, days = 1) => {
+    const raw = localStorage.getItem('circleup_upcoming_dismissed');
+    let map: Record<string,string> = {};
+    try { if (raw) map = JSON.parse(raw); } catch {}
+    const expiry = Date.now() + days*24*60*60*1000;
+    map[id] = expiry.toString();
+    localStorage.setItem('circleup_upcoming_dismissed', JSON.stringify(map));
+    setForceUpcomingRefresh(Date.now());
+  };
+
+  const handleUpcomingQuickLog = (item: UpcomingItem) => {
+    if (item.personId) {
+      handleQuickLog(item.personId, 'person');
+    } else if (item.groupId) {
+      handleQuickLog(item.groupId, 'group');
+    }
+  };
+
+  const handleUpcomingSnooze = (item: UpcomingItem) => {
+    if (item.type === 'reminder' && item.personId) {
+      // add one day to reminder date
+      setPeople(prev => prev.map(p => {
+        if (p.id !== item.personId) return p;
+        return {
+          ...p,
+          reminders: (p.reminders || []).map(r => {
+            if (r.id !== item.id) return r;
+            const d = new Date(r.date + 'T00:00:00');
+            d.setDate(d.getDate() + 1);
+            return { ...r, date: d.toISOString().split('T')[0] };
+          })
+        };
+      }));
+    } else {
+      // birthdays & group dates -> dismiss for today
+      dismissUpcomingItem(item.id, 1);
+    }
+  };
+
+  const handleUpcomingDelete = (item: UpcomingItem) => {
+    if (item.type === 'reminder' && item.personId) {
+      setPeople(prev => prev.map(p => p.id === item.personId ? { ...p, reminders: (p.reminders || []).filter(r => r.id !== item.id) } : p));
+    } else if (item.type === 'groupDate' && item.groupId) {
+      setGroups(prev => prev.map(g => g.id === item.groupId ? { ...g, customDates: (g.customDates || []).filter(cd => cd.id !== item.id) } : g));
+    }
+    setUpcomingMenuItem(null);
+  };
+
+  
 
   const findNameById = (id: string) => people.find(p => p.id === id)?.name || groups.find(g => g.id === id)?.name || 'Unknown';
 
@@ -463,10 +831,12 @@ function App() {
     googleCalendarUrl.searchParams.append('action', 'TEMPLATE');
     googleCalendarUrl.searchParams.append('text', activity.title);
 
-    const startDate = new Date(activity.date);
-    const startTime = `${startDate.toISOString().substring(0, 10).replace(/-/g, '')}`;
-    const endDate = new Date(startDate.getTime() + 24 * 60 * 60 * 1000); 
-    const endTime = `${endDate.toISOString().substring(0, 10).replace(/-/g, '')}`;
+  const startDate = parseLocalDate(activity.date);
+  const ymd = (d: Date) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const startTime = ymd(startDate).replace(/-/g, '');
+  const endLocal = new Date(startDate);
+  endLocal.setDate(endLocal.getDate() + 1);
+  const endTime = ymd(endLocal).replace(/-/g, '');
 
     googleCalendarUrl.searchParams.append('dates', `${startTime}/${endTime}`);
     googleCalendarUrl.searchParams.append('details', `${activity.notes}\n\nParticipants: ${activity.participantIds.map(findNameById).join(', ')}`);
@@ -486,7 +856,9 @@ function App() {
   const getModalContent = () => {
     switch (activeModal) {
       case 'add-person': return { title: 'Add New Person', content: <PersonForm onSave={handleSavePerson} onClose={handleModalClose} circles={circles} allPeople={people} connectionTypes={connectionTypes} /> };
-      case 'edit-person': return { title: `Edit ${editingPerson?.name}`, content: <PersonForm onSave={handleSavePerson} onDelete={handleDeletePerson} onClose={handleModalClose} personToEdit={editingPerson} circles={circles} groups={groups} allPeople={people} connectionTypes={connectionTypes} /> };
+      case 'edit-person': 
+        if (!editingPerson) return { title: 'Error', content: <div>Person not found</div> };
+        return { title: `Edit ${editingPerson.name}`, content: <PersonForm onSave={handleSavePerson} onDelete={handleDeletePerson} onClose={handleModalClose} personToEdit={editingPerson} circles={circles} groups={groups} allPeople={people} connectionTypes={connectionTypes} /> };
       case 'add-group': return { title: 'Create New Group', content: <GroupForm people={people.filter(p => !p.isMe)} onSave={handleSaveGroup} onClose={handleModalClose} connectionTypes={connectionTypes} circles={circles} /> };
       case 'edit-group': return { title: `Edit ${editingGroup?.name}`, content: <GroupForm people={people.filter(p => !p.isMe)} onSave={handleSaveGroup} onDelete={handleDeleteGroup} onClose={handleModalClose} groupToEdit={editingGroup} connectionTypes={connectionTypes} circles={circles} /> };
       case 'log-interaction': return { title: 'Log a Connection', content: <InteractionForm people={people.filter(p => !p.isMe)} groups={groups} onSave={handleSaveInteraction} onClose={handleModalClose} connectionTypes={connectionTypes} circles={circles} logForItem={loggingForItem} /> };
@@ -494,10 +866,58 @@ function App() {
       case 'plan-activity': return { title: 'Plan an Activity', content: <ActivityForm people={people} groups={groups} onSave={handleSaveActivity} onClose={handleModalClose} circles={circles} /> };
       case 'edit-activity': return { title: `Edit ${editingActivity?.title}`, content: <ActivityForm people={people} groups={groups} onSave={handleSaveActivity} onDelete={handleDeleteActivity} activityToEdit={editingActivity} onClose={handleModalClose} circles={circles} /> };
       case 'ai-generator': return { title: '✨ Generate Ideas with AI', content: <ActivityIdeaForm people={people} groups={groups} onClose={handleModalClose} circles={circles} /> };
-      case 'settings': return { title: 'Settings', content: <SettingsModal circles={circles} setCircles={setCircles} connectionTypes={connectionTypes} setConnectionTypes={setConnectionTypes} onClose={handleModalClose} /> };
+      case 'settings': return { title: 'Settings', content: <SettingsModal circles={circles} setCircles={setCircles} connectionTypes={connectionTypes} setConnectionTypes={setConnectionTypes} reminderLookahead={reminderLookahead} setReminderLookahead={setReminderLookahead} onClose={handleModalClose} onManualSync={async () => {
+        const uid = auth.currentUser?.uid;
+        if (!uid) { alert('Not signed in'); return; }
+        try {
+          await migrateLocalToCloud(uid);
+          await pullRemoteToLocal(uid);
+          setPeople(JSON.parse(localStorage.getItem('circleup_people') || '[]'));
+          setGroups(JSON.parse(localStorage.getItem('circleup_groups') || '[]'));
+          setInteractions(JSON.parse(localStorage.getItem('circleup_interactions') || '[]'));
+          setActivities(JSON.parse(localStorage.getItem('circleup_activities') || '[]'));
+          setSupportRequests(JSON.parse(localStorage.getItem('circleup_supportRequests') || '[]'));
+          setAskHistory(JSON.parse(localStorage.getItem('circleup_askHistory') || '[]'));
+          const rl = localStorage.getItem('circleup_reminderLookahead');
+          if (rl) setReminderLookahead(JSON.parse(rl));
+          const ts = Date.now();
+          setLastSyncAt(ts);
+          localStorage.setItem('circleup_lastSync', String(ts));
+          alert('Sync complete');
+        } catch (e) {
+          console.error('Manual sync failed', e);
+          alert('Sync failed');
+        }
+      }} lastSyncAt={lastSyncAt} /> };
       case 'add-support-request': return { title: 'Add a Favor / Support Request', content: <SupportRequestForm people={people.filter(p => !p.isMe)} groups={groups} onSave={handleSaveSupportRequest} onClose={handleModalClose} circles={circles} /> };
       case 'edit-support-request': return { title: `Edit ${editingSupportRequest?.name}`, content: <SupportRequestForm people={people.filter(p => !p.isMe)} groups={groups} onSave={handleSaveSupportRequest} onDelete={handleDeleteSupportRequest} supportRequestToEdit={editingSupportRequest} onClose={handleModalClose} circles={circles} />};
       case 'info': return { title: 'About CircleUp', content: <InfoModal /> };
+      case 'upgrade-account': return { 
+        title: 'Upgrade to Full Account', 
+        content: <UpgradeAccountModal 
+          onClose={handleModalClose} 
+          onUpgradeSuccess={() => {
+            // After upgrade, start cloud sync
+            const user = auth.currentUser;
+            if (user && !user.isAnonymous) {
+              startRealtimeSync(user.uid, {
+                onPeople: (items) => setPeople(items),
+                onGroups: (items) => setGroups(items),
+                onInteractions: (items) => setInteractions(items),
+                onActivities: (items) => setActivities(items),
+                onSupportRequests: (items) => setSupportRequests(items),
+                onAskHistory: (items) => setAskHistory(items),
+                onSettings: (settings) => {
+                  if (settings.circles) setCircles(settings.circles);
+                  if (settings.connectionTypes) setConnectionTypes(settings.connectionTypes);
+                  if (settings.reminderLookahead !== undefined) setReminderLookahead(settings.reminderLookahead);
+                  if (settings.theme) setIsDarkMode(settings.theme === 'dark');
+                }
+              });
+            }
+          }}
+        /> 
+      };
       default: return { title: '', content: null };
     }
   };
@@ -509,6 +929,7 @@ function App() {
       onClick={() => setActiveTab(tabId)} 
       className={`flex-grow sm:flex-grow-0 flex items-center justify-center sm:justify-start sm:gap-2 px-3 sm:px-4 sm:py-2 text-sm font-medium sm:rounded-md transition-colors duration-200 ${activeTab === tabId ? 'sm:bg-blue-600 sm:text-white' : 'text-gray-600 dark:text-gray-300 sm:hover:bg-gray-200 sm:dark:hover:bg-gray-700'} ${isMobile ? `h-full ${activeTab === tabId ? 'text-blue-600 dark:text-blue-500' : 'text-gray-400'}` : ''}`}
       aria-label={String(children)}
+      data-tab={tabId}
     >
       {icon}
       <span className="hidden sm:inline">{children}</span>
@@ -518,47 +939,86 @@ function App() {
   const meProfile = people.find(p => p.isMe);
   const otherPeople = people.filter(p => !p.isMe);
   const isContactsApiSupported = 'contacts' in navigator && 'select' in (navigator as any).contacts;
-  
-  const primaryFabConfig = useMemo(() => {
-    switch (activeTab) {
-        case 'people':
-            return {
-                visible: true,
-                onClick: () => setActiveModal('add-person'),
-                label: 'Add Person'
-            };
-        case 'groups':
-            return {
-                visible: true,
-                onClick: () => setActiveModal('add-group'),
-                label: 'Add Group'
-            };
-        case 'activities':
-            return {
-                visible: true,
-                onClick: () => setActiveModal('plan-activity'),
-                label: 'Plan Activity'
-            };
-        case 'ask-a-friend':
-            return {
-                visible: true,
-                onClick: () => setActiveModal('add-support-request'),
-                label: 'Add Favor'
-            };
-        default:
-            return { visible: false, onClick: () => {}, label: '' };
-    }
-  }, [activeTab]);
 
-  const navContent = (isMobile: boolean) => (
+  // --- Debounced write-through syncing ---
+  const DEBOUNCE_DELAY = 1500;
+  const debouncedPeople = useDebounce(people, DEBOUNCE_DELAY);
+  const debouncedGroups = useDebounce(groups, DEBOUNCE_DELAY);
+  const debouncedInteractions = useDebounce(interactions, DEBOUNCE_DELAY);
+  const debouncedActivities = useDebounce(activities, DEBOUNCE_DELAY);
+  const debouncedSupportRequests = useDebounce(supportRequests, DEBOUNCE_DELAY);
+  const debouncedAskHistory = useDebounce(askHistory, DEBOUNCE_DELAY);
+  const debouncedSettings = useDebounce({
+    circles,
+    connectionTypes,
+    reminderLookahead,
+    theme: isDarkMode ? 'dark' : 'light'
+  }, DEBOUNCE_DELAY);
+
+  useEffect(() => {
+    const uid = currentUser?.uid;
+    const isAnonymous = currentUser?.isAnonymous;
+    // Skip cloud sync for anonymous (guest) users - they stay local-only
+    if (!uid || isAnonymous) return;
+    // Optional: skip very first empty syncs if all lists are empty
+    const allEmpty = [debouncedPeople, debouncedGroups, debouncedInteractions, debouncedActivities, debouncedSupportRequests, debouncedAskHistory]
+      .every(arr => Array.isArray(arr) && arr.length === 0);
+    if (allEmpty) return;
+
+    const stateToSync = {
+      people: debouncedPeople,
+      groups: debouncedGroups,
+      interactions: debouncedInteractions,
+      activities: debouncedActivities,
+      supportRequests: debouncedSupportRequests,
+      askHistory: debouncedAskHistory,
+      settings: debouncedSettings
+    };
+
+    syncStateToCloud(uid, stateToSync);
+  }, [currentUser?.uid, currentUser?.isAnonymous, debouncedPeople, debouncedGroups, debouncedInteractions, debouncedActivities, debouncedSupportRequests, debouncedAskHistory, debouncedSettings]);
+
+    const primaryFabConfig = useMemo(() => {
+    switch (activeTab) {
+      case 'people':
+        return {
+          visible: true,
+          onClick: () => setActiveModal('add-person'),
+          label: 'Add Person'
+        };
+      case 'groups':
+        return {
+          visible: true,
+          onClick: () => setActiveModal('add-group'),
+          label: 'Add Group'
+        };
+      case 'activities':
+        return {
+          visible: true,
+          onClick: () => setActiveModal('plan-activity'),
+          label: 'Plan Activity'
+        };
+      case 'ask-a-friend':
+        return {
+          visible: true,
+          onClick: () => setActiveModal('add-support-request'),
+          label: 'Add Favor'
+        };
+      default:
+        return { visible: false, onClick: () => {}, label: '' };
+    }
+    }, [activeTab]);
+
+    const navContent = (isMobile: boolean) => (
       <>
-          <TabButton tabId="dashboard" isMobile={isMobile} icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" /></svg>}>Dashboard</TabButton>
-          <TabButton tabId="people" isMobile={isMobile} icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>}>People</TabButton>
-          <TabButton tabId="groups" isMobile={isMobile} icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283-.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" /></svg>}>Groups</TabButton>
-          <TabButton tabId="activities" isMobile={isMobile} icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="1.5" stroke="currentColor" className="h-8 w-8"><path strokeLinecap="round" strokeLinejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 0 1 2.25-2.25h13.5A2.25 2.25 0 0 1 21 7.5v11.25m-18 0A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75m-18 0v-7.5A2.25 2.25 0 0 1 5.25 9h13.5A2.25 2.25 0 0 1 21 11.25v7.5m-9-6h.008v.008H12v-.008ZM12 15h.008v.008H12V15Zm0 2.25h.008v.008H12v-.008ZM9.75 15h.008v.008H9.75V15Zm0 2.25h.008v.008H9.75v-.008ZM7.5 15h.008v.008H7.5V15Zm0 2.25h.008v.008H7.5v-.008Zm6.75-4.5h.008v.008h-.008v-.008Zm0 2.25h.008v.008h-.008V15Zm0 2.25h.008v.008h-.008v-.008Zm2.25-4.5h.008v.008H16.5v-.008Zm0 2.25h.008v.008H16.5V15Z" /></svg>}>Activities</TabButton>
-          <TabButton tabId="ask-a-friend" isMobile={isMobile} icon={<svg fill="currentColor" viewBox="-47.31 -47.31 567.70 567.70" className="h-8 w-8"><path d="M471.176,162.893c-2.537-2.539-6.653-2.539-9.192,0l-40.487,40.488c-1.054,1.054-1.713,2.438-1.868,3.921 c-3.223,30.84-17.072,59.9-38.999,81.826l-9.621,9.621l-69.908-69.908c4.422,1.044,8.75,1.572,12.953,1.572 c6.165,0,12.065-1.127,17.607-3.395c3.323-1.359,4.914-5.155,3.555-8.477c-1.359-3.324-5.156-4.913-8.477-3.555 c-26.768,10.951-57.628-18.195-61.515-22.022l-18.575-18.575c2.306-9.78,0.315-20.276-5.615-28.803 c-6.704-9.638-17.362-15.165-29.287-15.165l-44.991,0.322c-0.04,0-0.08,0-0.119,0c-4.307,0-8.357-1.669-11.416-4.707 c-3.087-3.066-4.787-7.151-4.786-11.504v-0.677c0.002-8.733,6.84-15.844,15.567-16.188l81.933-3.228 c29.569-1.164,59.042,7.816,82.946,25.285c2.588,1.89,6.166,1.614,8.431-0.652l43.032-43.032c2.539-2.538,2.539-6.654,0.001-9.192 c-2.539-2.539-6.654-2.539-9.193,0l-39.173,39.174c-25.398-17.079-55.919-25.778-86.556-24.573l-81.933,3.228 c-0.193,0.008-0.382,0.025-0.573,0.037l-31.087-31.086c-2.538-2.539-6.654-2.539-9.192,0c-2.539,2.538-2.539,6.654,0,9.192 l26.352,26.352c-8.178,5.174-13.552,14.289-13.555,24.682v0.677c-0.002,7.842,3.062,15.204,8.625,20.73 c5.564,5.526,12.941,8.539,20.789,8.482l44.944-0.322c10.353,0,16.077,6.007,18.567,9.588c1.897,2.727,3.168,5.757,3.787,8.879 l-2.228-2.228c-2.538-2.539-6.654-2.539-9.192,0c-2.539,2.538-2.539,6.654,0,9.192l146.666,146.666 c6.334,6.333,6.334,16.639,0,22.972c-6.33,6.331-16.63,6.332-22.962,0.008l-93.42-93.419c-2.537-2.539-6.654-2.539-9.191,0 c-2.539,2.538-2.539,6.654,0,9.192l100.622,100.623c6.334,6.333,6.334,16.639,0,22.972c-3.067,3.068-7.146,4.758-11.486,4.758 c-4.339,0-8.418-1.69-11.485-4.758l-95.387-95.387c-2.539-2.538-6.654-2.538-9.192,0s-2.539,6.654,0,9.192l78.161,78.162 c6.328,6.334,6.326,16.634-0.005,22.965c-6.335,6.334-16.64,6.333-22.973,0l-84.888-84.888c-2.538-2.539-6.654-2.539-9.192,0 c-2.539,2.538-2.539,6.654,0,9.192l62.967,62.967c0,0,0.001,0.001,0.001,0.001c6.334,6.333,6.334,16.638,0,22.972 c-6.332,6.333-16.638,6.333-22.971,0L104.073,289.128c-21.926-21.926-35.776-50.986-38.998-81.826 c-0.155-1.483-0.814-2.867-1.869-3.921l-52.11-52.111c-2.538-2.539-6.654-2.539-9.192,0c-2.539,2.538-2.539,6.654,0,9.192 l50.502,50.502c3.968,32.934,18.996,63.876,42.475,87.355l9.586,9.586c-3.569,4.941-5.5,10.856-5.5,17.071 c0,7.811,3.042,15.155,8.565,20.678c5.701,5.701,13.189,8.552,20.678,8.552c0.737,0,1.473-0.036,2.208-0.091 c-0.251,1.552-0.386,3.134-0.386,4.737c0,7.811,3.042,15.155,8.565,20.678c5.701,5.701,13.189,8.552,20.678,8.552 c1.457,0,2.914-0.111,4.358-0.327c-1.325,8.865,1.414,18.226,8.224,25.036c5.523,5.523,12.867,8.565,20.678,8.565 c6.962,0,13.549-2.422,18.811-6.859c5.294,4.191,11.71,6.293,18.131,6.293c7.488,0,14.978-2.851,20.679-8.552 c4.247-4.247,6.909-9.487,7.992-14.979l4.733,4.733c5.702,5.702,13.189,8.552,20.679,8.552c7.488,0,14.979-2.851,20.68-8.552 c4.247-4.247,6.909-9.486,7.992-14.978l0.045,0.045c5.523,5.523,12.867,8.565,20.679,8.565c7.813,0,15.156-3.042,20.68-8.565 c8.349-8.349,10.576-20.53,6.698-30.932c6.66-0.55,13.168-3.36,18.252-8.445c10.858-10.858,11.368-28.195,1.546-39.672l9.69-9.691 c23.479-23.479,38.507-54.422,42.476-87.356l38.879-38.879C473.715,169.546,473.715,165.431,471.176,162.893z M116.725,336.462 c-3.068-3.068-4.758-7.147-4.758-11.486c0-2.717,0.663-5.331,1.911-7.66l21.992,21.992c-2.328,1.248-4.943,1.911-7.66,1.911 C123.872,341.221,119.793,339.531,116.725,336.462z M147.79,370.339c-3.068-3.068-4.758-7.147-4.758-11.486 c0-3.413,1.059-6.656,2.999-9.382l22.624,22.624C162.318,376.587,153.464,376.012,147.79,370.339z M181.05,403.599 c-5.674-5.674-6.248-14.527-1.756-20.865l22.624,22.624c-2.726,1.939-5.97,2.999-9.383,2.999 C188.197,408.357,184.118,406.667,181.05,403.599z" /></svg>}>Ask a Friend</TabButton>
+        <TabButton tabId="dashboard" isMobile={isMobile} icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" /></svg>}>Dashboard</TabButton>
+        <TabButton tabId="people" isMobile={isMobile} icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>}>People</TabButton>
+        <TabButton tabId="groups" isMobile={isMobile} icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283-.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" /></svg>}>Groups</TabButton>
+        <TabButton tabId="activities" isMobile={isMobile} icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="1.5" stroke="currentColor" className="h-8 w-8"><path strokeLinecap="round" strokeLinejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 0 1 2.25-2.25h13.5A2.25 2.25 0 0 1 21 7.5v11.25m-18 0A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75m-18 0v-7.5A2.25 2.25 0 0 1 5.25 9h13.5A2.25 2.25 0 0 1 21 11.25v7.5m-9-6h.008v.008H12v-.008ZM12 15h.008v.008H12V15Zm0 2.25h.008v.008H12v-.008ZM9.75 15h.008v.008H9.75V15Zm0 2.25h.008v.008H9.75v-.008ZM7.5 15h.008v.008H7.5V15Zm0 2.25h.008v.008H7.5v-.008Zm6.75-4.5h.008v.008h-.008v-.008Zm0 2.25h.008v.008h-.008V15Zm0 2.25h.008v.008h-.008v-.008Zm2.25-4.5h.008v.008H16.5v-.008Zm0 2.25h.008v.008H16.5V15Z" /></svg>}>Activities</TabButton>
+        <TabButton tabId="ask-a-friend" isMobile={isMobile} icon={<svg fill="currentColor" viewBox="-47.31 -47.31 567.70 567.70" className="h-8 w-8"><path d="M471.176,162.893c-2.537-2.539-6.653-2.539-9.192,0l-40.487,40.488c-1.054,1.054-1.713,2.438-1.868,3.921 c-3.223,30.84-17.072,59.9-38.999,81.826l-9.621,9.621l-69.908-69.908c4.422,1.044,8.75,1.572,12.953,1.572 c6.165,0,12.065-1.127,17.607-3.395c3.323-1.359,4.914-5.155,3.555-8.477c-1.359-3.324-5.156-4.913-8.477-3.555 c-26.768,10.951-57.628-18.195-61.515-22.022l-18.575-18.575c2.306-9.78,0.315-20.276-5.615-28.803 c-6.704-9.638-17.362-15.165-29.287-15.165l-44.991,0.322c-0.04,0-0.08,0-0.119,0c-4.307,0-8.357-1.669-11.416-4.707 c-3.087-3.066-4.787-7.151-4.786-11.504v-0.677c0.002-8.733,6.84-15.844,15.567-16.188l81.933-3.228 c29.569-1.164,59.042,7.816,82.946,25.285c2.588,1.89,6.166,1.614,8.431-0.652l43.032-43.032c2.539-2.538,2.539-6.654,0.001-9.192 c-2.539-2.539-6.654-2.539-9.193,0l-39.173,39.174c-25.398-17.079-55.919-25.778-86.556-24.573l-81.933,3.228 c-0.193,0.008-0.382,0.025-0.573,0.037l-31.087-31.086c-2.538-2.539-6.654-2.539-9.192,0c-2.539,2.538-2.539,6.654,0,9.192 l26.352,26.352c-8.178,5.174-13.552,14.289-13.555,24.682v0.677c-0.002,7.842,3.062,15.204,8.625,20.73 c5.564,5.526,12.941,8.539,20.789,8.482l44.944-0.322c10.353,0,16.077,6.007,18.567,9.588c1.897,2.727,3.168,5.757,3.787,8.879 l-2.228-2.228c-2.538-2.539-6.654-2.539-9.192,0c-2.539,2.538-2.539,6.654,0,9.192l146.666,146.666 c6.334,6.333,6.334,16.639,0,22.972c-6.33,6.331-16.63,6.332-22.962,0.008l-93.42-93.419c-2.537-2.539-6.654-2.539-9.191,0 c-2.539,2.538-2.539,6.654,0,9.192l100.622,100.623c6.334,6.333,6.334,16.639,0,22.972c-3.067,3.068-7.146,4.758-11.486,4.758 c-4.339,0-8.418-1.69-11.485-4.758l-95.387-95.387c-2.539-2.538-6.654-2.538-9.192,0s-2.539,6.654,0,9.192l78.161,78.162 c6.328,6.334,6.326,16.634-0.005,22.965c-6.335,6.334-16.64,6.333-22.973,0l-84.888-84.888c-2.538-2.539-6.654-2.539-9.192,0 c-2.539,2.538-2.539,6.654,0,9.192l62.967,62.967c0,0,0.001,0.001,0.001,0.001c6.334,6.333,6.334,16.638,0,22.972 c-6.332,6.333-16.638,6.333-22.971,0L104.073,289.128c-21.926-21.926-35.776-50.986-38.998-81.826 c-0.155-1.483-0.814-2.867-1.869-3.921l-52.11-52.111c-2.538-2.539-6.654-2.539-9.192,0c-2.539,2.538-2.539,6.654,0,9.192 l50.502,50.502c3.968,32.934,18.996,63.876,42.475,87.355l9.586,9.586c-3.569,4.941-5.5,10.856-5.5,17.071 c0,7.811,3.042,15.155,8.565,20.678c5.701,5.701,13.189,8.552,20.678,8.552c0.737,0,1.473-0.036,2.208-0.091 c-0.251,1.552-0.386,3.134-0.386,4.737c0,7.811,3.042,15.155,8.565,20.678c5.701,5.701,13.189,8.552,20.678,8.552 c1.457,0,2.914-0.111,4.358-0.327c-1.325,8.865,1.414,18.226,8.224,25.036c5.523,5.523,12.867,8.565,20.678,8.565 c6.962,0,13.549-2.422,18.811-6.859c5.294,4.191,11.71,6.293,18.131,6.293c7.488,0,14.978-2.851,20.679-8.552 c4.247-4.247,6.909-9.487,7.992-14.979l4.733,4.733c5.702,5.702,13.189,8.552,20.679,8.552c7.488,0,14.979-2.851,20.68-8.552 c4.247-4.247,6.909-9.486,7.992-14.978l0.045,0.045c5.523,5.523,12.867,8.565,20.679,8.565c7.813,0,15.156-3.042,20.68-8.565 c8.349-8.349,10.576-20.53,6.698-30.932c6.66-0.55,13.168-3.36,18.252-8.445c10.858-10.858,11.368-28.195,1.546-39.672l9.69-9.691 c23.479-23.479,38.507-54.422,42.476-87.356l38.879-38.879C473.715,169.546,473.715,165.431,471.176,162.893z M116.725,336.462 c-3.068-3.068-4.758-7.147-4.758-11.486c0-2.717,0.663-5.331,1.911-7.66l21.992,21.992c-2.328,1.248-4.943,1.911-7.66,1.911 C123.872,341.221,119.793,339.531,116.725,336.462z M147.79,370.339c-3.068-3.068-4.758-7.147-4.758-11.486 c0-3.413,1.059-6.656,2.999-9.382l22.624,22.624C162.318,376.587,153.464,376.012,147.79,370.339z M181.05,403.599 c-5.674-5.674-6.248-14.527-1.756-20.865l22.624,22.624c-2.726,1.939-5.97,2.999-9.383,2.999 C188.197,408.357,184.118,406.667,181.05,403.599z" /></svg>}>Ask a Friend</TabButton>
       </>
-  );
+    );
+  
   
   // People Tab: Move Pinned Person
   const handleMovePinnedPerson = (personId: string, direction: 'up' | 'down') => {
@@ -597,6 +1057,218 @@ function App() {
     });
   };
 
+  // Share your card - open selection modal
+  const handleShareMyCard = () => {
+    if (!meProfile) return;
+    setSharingCard({
+      interests: meProfile.interests.length > 0,
+      dislikes: meProfile.dislikes.length > 0,
+      birthdate: !!meProfile.birthdate,
+      giftIdeas: (meProfile.giftIdeas?.length || 0) > 0,
+    });
+  };
+
+  // Confirm and execute share
+  const [manualShareLink, setManualShareLink] = useState<string | null>(null);
+  const handleConfirmShare = async () => {
+    if (!meProfile || !sharingCard) return;
+    
+    const card: ShareablePersonCard = {
+      version: 1,
+      name: meProfile.name,
+      interests: sharingCard.interests ? meProfile.interests : [],
+      dislikes: sharingCard.dislikes ? meProfile.dislikes : [],
+      birthdate: sharingCard.birthdate ? meProfile.birthdate : undefined,
+      giftIdeas: sharingCard.giftIdeas ? meProfile.giftIdeas : [],
+    };
+    
+    const cardJson = JSON.stringify(card);
+    const encoded = btoa(cardJson);
+    // Use hosted domain when on native so pasted link is universal (avoids capacitor:// scheme)
+    const baseUrl = Capacitor.isNativePlatform() ? 'https://circleup-bdd94.web.app' : window.location.origin;
+    const shareUrl = `${baseUrl}/?import=${encoded}`;
+    
+    try {
+      const isNative = Capacitor.isNativePlatform();
+
+      if (isNative) {
+        // Use Capacitor Share on native
+        try {
+          await Share.share({
+            title: `${meProfile.name}'s CircleUp Card`,
+            text: 'Import my CircleUp profile! ',
+            url: shareUrl,
+            dialogTitle: 'Share CircleUp Card'
+          });
+          setShowToast('Share sheet opened');
+          setSharingCard(null);
+          setTimeout(() => setShowToast(null), 3000);
+          return;
+        } catch (nativeShareErr) {
+          console.warn('[share] Native Share failed, falling back to clipboard:', nativeShareErr);
+        }
+        // Native clipboard fallback
+        try {
+          await Clipboard.write({ string: shareUrl });
+          // Optional read-back verification (some WKWebView versions may ignore write silently)
+          try {
+            const readBack = await Clipboard.read();
+            if (!readBack?.value || !String(readBack.value).includes('/?import=')) {
+              console.warn('[share] Clipboard verification uncertain:', readBack?.value);
+            }
+          } catch {}
+          setShowToast('Link copied to clipboard!');
+          setSharingCard(null);
+          setTimeout(() => setShowToast(null), 3000);
+          return;
+        } catch (clipErr) {
+          console.warn('[share] Native clipboard failed, showing manual copy UI.', clipErr);
+        }
+      }
+
+      // Web: Try native share first if available and secure
+      if (navigator.share && window.isSecureContext) {
+        try {
+          await navigator.share({
+            title: `${meProfile.name}'s CircleUp Card`,
+            text: 'Import my CircleUp profile!',
+            url: shareUrl,
+          });
+          setShowToast('Shared successfully!');
+          setSharingCard(null);
+          setTimeout(() => setShowToast(null), 3000);
+          return;
+        } catch (shareErr: any) {
+          if (shareErr.name === 'AbortError') return; // user canceled
+          console.log('Web share failed, trying clipboard:', shareErr);
+        }
+      }
+
+      // Web clipboard fallback
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(shareUrl);
+        setShowToast('Link copied to clipboard!');
+      } else {
+        const textArea = document.createElement('textarea');
+        textArea.value = shareUrl;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+        setShowToast('Link copied to clipboard!');
+      }
+      setSharingCard(null);
+      setTimeout(() => setShowToast(null), 3000);
+      // If we reach here on native without early return, we succeeded via web pathway
+    } catch (err) {
+      console.error('All share methods failed:', err);
+      // As a last resort, show manual share overlay with selectable text
+      setManualShareLink(shareUrl);
+      setShowToast('Share failed. Manual copy shown.');
+      setTimeout(() => setShowToast(null), 3000);
+    }
+  };
+
+  // Import a received card
+  const handleImportCard = (card: ShareablePersonCard) => {
+    // Never auto-match with "Me" profile - always show manual selection
+    const existingPerson = people.find(p => 
+      !p.isMe && p.name.toLowerCase() === card.name.toLowerCase()
+    );
+    
+    if (existingPerson) {
+      // Show merge UI
+      setMergingCard({ 
+        card, 
+        existingPerson,
+        mergeOptions: { interests: false, dislikes: false, birthdate: false, giftIdeas: false }
+      });
+    } else {
+      // Show import preview with option to manually merge
+      setImportingCard(card);
+    }
+  };
+
+  // User wants to manually select a person to merge with
+  const handleManualMerge = () => {
+    if (!importingCard) return;
+    setManualMergeCard(importingCard);
+    setImportingCard(null);
+  };
+
+  const handleSelectPersonForMerge = (personId: string) => {
+    if (!manualMergeCard) return;
+    const person = people.find(p => p.id === personId);
+    if (!person) return;
+    
+    setMergingCard({
+      card: manualMergeCard,
+      existingPerson: person,
+      mergeOptions: { interests: false, dislikes: false, birthdate: false, giftIdeas: false }
+    });
+    setManualMergeCard(null);
+  };
+
+  const handleConfirmImport = () => {
+    if (!importingCard) return;
+    
+    const newPerson: Person = {
+      id: Date.now().toString(),
+      name: importingCard.name,
+      interests: importingCard.interests,
+      dislikes: importingCard.dislikes,
+      birthdate: importingCard.birthdate || '',
+      giftIdeas: importingCard.giftIdeas || [],
+      circles: [],
+      connectionGoal: { type: connectionTypes[0] || 'Call', frequency: 30 },
+      lastConnection: new Date(0).toISOString(),
+      notes: '',
+      followUpTopics: '',
+      reminders: [],
+      isPinned: false,
+      showOnDashboard: true,
+    };
+    
+    setPeople(prev => [...prev, newPerson]);
+    setImportingCard(null);
+    alert(`${newPerson.name} added to your connections!`);
+  };
+
+  const handleConfirmMerge = (mergeOptions: { interests: boolean; dislikes: boolean; birthdate: boolean; giftIdeas: boolean }) => {
+    if (!mergingCard) return;
+    
+    const { card, existingPerson } = mergingCard;
+    const updated = { ...existingPerson };
+    
+    if (mergeOptions.interests) {
+      // Merge interests (add new ones)
+      const combined = new Set([...updated.interests, ...card.interests]);
+      updated.interests = Array.from(combined);
+    }
+    
+    if (mergeOptions.dislikes) {
+      const combined = new Set([...updated.dislikes, ...card.dislikes]);
+      updated.dislikes = Array.from(combined);
+    }
+    
+    if (mergeOptions.birthdate && card.birthdate) {
+      updated.birthdate = card.birthdate;
+    }
+    
+    if (mergeOptions.giftIdeas && card.giftIdeas) {
+      // Add new gift ideas
+      const existingTexts = new Set(updated.giftIdeas?.map(g => g.text.toLowerCase()) || []);
+      const newGifts = card.giftIdeas.filter(g => !existingTexts.has(g.text.toLowerCase()));
+      updated.giftIdeas = [...(updated.giftIdeas || []), ...newGifts.map(g => ({ ...g, id: Date.now().toString() + Math.random() }))];
+    }
+    
+    setPeople(prev => prev.map(p => p.id === existingPerson.id ? updated : p));
+    setMergingCard(null);
+    alert(`${card.name}'s card merged!`);
+  };
+
   // People Tab: Data organization
   const pinnedPeople = useMemo(() => otherPeople.filter(p => p.isPinned).sort((a, b) => (a.pinOrder || 0) - (b.pinOrder || 0)), [otherPeople]);
   const unpinnedPeople = useMemo(() => otherPeople.filter(p => !p.isPinned), [otherPeople]);
@@ -621,25 +1293,96 @@ function App() {
     );
   };
 
+  // Check for import card on load (after people data is available)
+  useEffect(() => {
+    if (!currentUser || loading) return; // Wait until user is loaded
+    
+    const urlParams = new URLSearchParams(window.location.search);
+    const importData = urlParams.get('import');
+    
+    if (importData) {
+      try {
+        const decoded = atob(importData);
+        const card: ShareablePersonCard = JSON.parse(decoded);
+        
+        const existingPerson = people.find(p => 
+          p.name.toLowerCase() === card.name.toLowerCase()
+        );
+        
+        if (existingPerson) {
+          // Show merge UI
+          setMergingCard({ 
+            card, 
+            existingPerson,
+            mergeOptions: { interests: false, dislikes: false, birthdate: false, giftIdeas: false }
+          });
+        } else {
+          // Show import preview
+          setImportingCard(card);
+        }
+        
+        // Clean URL
+        window.history.replaceState({}, '', window.location.pathname);
+      } catch (err) {
+        console.error('Failed to import card:', err);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser, loading, people]);
 
-  if (loading) {
+  // Show splash while bootStage === 'splash' OR while postLoginLoading overlay active
+  if (bootStage === 'splash' || postLoginLoading) {
     return (
       <div className="min-h-screen flex flex-col justify-center items-center bg-gray-100 dark:bg-gray-900 text-center p-4">
-        <Spinner size={72} />
-        <h1 className="mt-6 text-5xl font-bold text-blue-600 dark:text-blue-500">CircleUp</h1>
-        <p className="mt-4 text-lg text-gray-600 dark:text-gray-400">Pursue Meaningful and Active Connection to Others</p>
+        <div className="relative w-full max-w-md aspect-square flex items-center justify-center">
+          {/* Your app icon in the center */}
+          <img 
+            src="/icon-512.png" 
+            alt="CircleUp" 
+            className="absolute w-3/5 h-3/5 rounded-3xl shadow-lg z-10"
+          />
+          {/* Animated circle around the icon - larger and spinning reverse */}
+          <svg className="absolute w-full h-full animate-slow-spin-reverse text-blue-600 dark:text-blue-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2"></circle>
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+          </svg>
+        </div>
+        <p className="mt-8 text-lg text-gray-600 dark:text-gray-400">Pursue Meaningful and Active Connection to Others</p>
+        {bootStage === 'splash' && <p className="mt-4 text-xs text-gray-400">Initializing...</p>}
+        {postLoginLoading && <p className="mt-4 text-xs text-gray-400">Signing in...</p>}
       </div>
     );
   }
 
-  // 2. If we're done loading and there is NO user, show the LoginPage
-  if (!currentUser) {
-    return <LoginPage />;
+  // After splash: if not authenticated and in auth stage, show login
+  if (bootStage === 'auth' && !currentUser) {
+    return <LoginScreen />;
   }
 
   return (
     <div className="bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100 min-h-screen font-sans overflow-x-hidden">
-      <header className="bg-white dark:bg-gray-800 shadow-sm sticky top-0 z-20">
+      {/* Guest mode banner */}
+      {currentUser?.isAnonymous && (
+        <div className="bg-yellow-50 dark:bg-yellow-900/20 border-b border-yellow-200 dark:border-yellow-800">
+          <div className="container mx-auto px-4 py-2 flex items-center justify-between gap-3 text-sm">
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              <svg className="h-5 w-5 text-yellow-600 dark:text-yellow-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span className="text-yellow-800 dark:text-yellow-200 truncate">
+                <strong>Guest mode:</strong> Your data is local-only and won't sync across devices.
+              </span>
+            </div>
+            <button
+              onClick={() => setActiveModal('upgrade-account')}
+              className="px-3 py-1 bg-yellow-600 hover:bg-yellow-700 text-white rounded-md text-xs font-semibold whitespace-nowrap flex-shrink-0"
+            >
+              Create Account
+            </button>
+          </div>
+        </div>
+      )}
+      <header className="bg-white dark:bg-gray-800 shadow-sm sticky top-0 z-20 safe-top">
         <div className="container mx-auto px-4 py-3 flex justify-between items-center">
             <h1 className="text-2xl font-bold text-gray-800 dark:text-gray-100">CircleUp</h1>
             <div className="flex items-center space-x-2 sm:space-x-4">
@@ -649,12 +1392,14 @@ function App() {
                     </svg>
                     <span className="hidden sm:inline">Generate Ideas</span>
                 </button>
-                <button onClick={() => setActiveModal('info')} className="text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200" aria-label="Information">
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                </button>
-                <button onClick={() => setActiveModal('settings')} className="text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200" aria-label="Settings">
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924-1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-                </button>
+                <div data-tour="help-settings" className="flex gap-2">
+                  <button data-tour="info-icon" onClick={() => setActiveModal('info')} className="text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200" aria-label="Information">
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                  </button>
+                  <button data-tour="settings-icon" onClick={() => setActiveModal('settings')} className="text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200" aria-label="Settings">
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924-1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                  </button>
+                </div>
                 <button onClick={toggleDarkMode} className="text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200" aria-label="Toggle dark mode">
                     {isDarkMode ? 
                         <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" /></svg> :
@@ -724,6 +1469,46 @@ function App() {
                         </ul>
                     </div>
                 </section>
+                {upcomingReminders.length > 0 && (
+                    <section>
+                        <h2 className="text-xl font-semibold mb-4">Upcoming Reminders</h2>
+                        <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                            <ul className="divide-y divide-gray-200 dark:divide-gray-700">
+                        {upcomingReminders.map(item => {
+                          const isToday = item.date.toDateString() === new Date().toDateString();
+                          const rightLabel = item.type === 'reminder' ? 'Snooze' : 'Dismiss';
+                          return (
+                            <SwipeableListItem
+                              key={item.id}
+                              onFullSwipeLeft={() => handleUpcomingQuickLog(item)}
+                              onFullSwipeRight={() => handleUpcomingSnooze(item)}
+                              leftActionView={<div className="bg-green-500 h-full w-full flex flex-col items-center justify-center text-white"><svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" /></svg><span className="text-xs font-semibold mt-1">Log</span></div>}
+                              rightActionView={<div className="bg-yellow-500 h-full w-full flex flex-col items-center justify-center text-white"><svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg><span className="text-xs font-semibold mt-1">{rightLabel}</span></div>}
+                            >
+                              <div className="p-4 w-full" onClick={() => setUpcomingMenuItem(item)}>
+                                <div className="flex items-start gap-3">
+                                  <div className="pt-0.5">
+                                    {item.type === 'birthday' && <span className="text-2xl">🎂</span>}
+                                    {item.type === 'reminder' && <span className="text-2xl">⏰</span>}
+                                    {item.type === 'groupDate' && <span className="text-2xl">📅</span>}
+                                  </div>
+                                  <div className="min-w-0">
+                                    <h3 className="font-semibold break-words">{item.title}</h3>
+                                    <p className="text-sm text-gray-600 dark:text-gray-400 break-words">{item.subtitle}</p>
+                                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                                      {item.displayDate}
+                                      {isToday && <span className="ml-2 text-blue-600 dark:text-blue-400 font-semibold">Today!</span>}
+                                    </p>
+                                  </div>
+                                </div>
+                              </div>
+                            </SwipeableListItem>
+                          );
+                        })}
+                            </ul>
+                        </div>
+                    </section>
+                )}
                 <PastConnections 
                     interactions={interactions} 
                     people={people} 
@@ -734,6 +1519,28 @@ function App() {
                         setActiveModal('edit-interaction');
                     }}
                 />
+                {upcomingMenuItem && (
+                  <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center">
+                    <div className="bg-white dark:bg-gray-800 w-full sm:w-80 rounded-t-lg sm:rounded-lg p-4 space-y-3">
+                      <h3 className="font-semibold">{upcomingMenuItem.title}</h3>
+                      <p className="text-sm text-gray-600 dark:text-gray-400">{upcomingMenuItem.subtitle}</p>
+                      <button
+                        className="w-full bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded"
+                        onClick={() => { handleUpcomingQuickLog(upcomingMenuItem); setUpcomingMenuItem(null); }}
+                      >Log Connection</button>
+                      {(upcomingMenuItem.type === 'reminder' || upcomingMenuItem.type === 'groupDate') && (
+                        <button
+                          className="w-full bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded"
+                          onClick={() => handleUpcomingDelete(upcomingMenuItem)}
+                        >Delete</button>
+                      )}
+                      <button
+                        className="w-full bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-800 dark:text-gray-100 px-4 py-2 rounded"
+                        onClick={() => setUpcomingMenuItem(null)}
+                      >Cancel</button>
+                    </div>
+                  </div>
+                )}
             </div>
         )}
         {activeTab === 'people' && (
@@ -747,32 +1554,63 @@ function App() {
                                 <span>Import</span>
                             </button>
                         )}
-                        <button onClick={() => setActiveModal('add-person')} className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 text-sm">Add Person</button>
+                        <button data-tour="add-person" onClick={() => setActiveModal('add-person')} className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 text-sm">Add Person</button>
                     </div>
                  </div>
 
                  {meProfile && (
-                     <div onClick={() => {setEditingPerson(meProfile); setActiveModal('edit-person');}} className="p-4 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer bg-green-50 dark:bg-green-900/20 rounded-lg shadow">
-                        <p className="font-semibold">{meProfile.name} ⭐</p>
-                        <p className="text-sm text-gray-500 dark:text-gray-400">This is you! Keep your profile updated for better AI suggestions.</p>
-                    </div>
+                   <div className="flex items-center gap-3">
+                     <div className="bg-green-50 dark:bg-green-900/20 rounded-lg shadow w-full max-w-md">
+                        <div
+                          onClick={() => {
+                            if (meProfile) {
+                              setEditingPerson(meProfile);
+                              setActiveModal('edit-person');
+                            }
+                          }}
+                          className="p-2 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
+                        >
+                          <p className="font-semibold">Me ⭐</p>
+                        </div>
+                      </div>
+                      <div className="flex flex-col gap-2">
+                        <button
+                          onClick={() => {
+                            handleShareMyCard();
+                          }}
+                          className="bg-gray-500 hover:bg-gray-600 text-white p-2 rounded-md flex items-center justify-center"
+                          title="Share your card"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                            <path d="M15 8a3 3 0 10-2.977-2.63l-4.94 2.47a3 3 0 100 4.319l4.94 2.47a3 3 0 10.895-1.789l-4.94-2.47a3.027 3.027 0 000-.74l4.94-2.47C13.456 7.68 14.19 8 15 8z" />
+                          </svg>
+                        </button>
+                      </div>
+                   </div>
                  )}
                  
                  {pinnedPeople.length > 0 && (
-                    <div>
-                        <div className="flex justify-between items-center mb-2">
+                    <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                        <button 
+                          onClick={() => setIsPinnedCollapsed(!isPinnedCollapsed)} 
+                          className="w-full p-3 text-left flex justify-between items-center bg-gray-50 dark:bg-gray-700/50 hover:bg-gray-100 dark:hover:bg-gray-700"
+                        >
                             <h3 className="text-sm font-bold uppercase text-gray-500 dark:text-gray-400 flex items-center gap-2">
                                 <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor"><path d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z"/></svg>
                                 Pinned
                             </h3>
-                             <button
-                                onClick={() => setIsPinnedReorderMode(!isPinnedReorderMode)}
-                                className="px-2 py-1 text-xs font-semibold text-white bg-blue-500 rounded-md hover:bg-blue-600"
-                            >
-                                {isPinnedReorderMode ? 'Done' : 'Reorder'}
-                            </button>
-                        </div>
-                        <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                            <svg xmlns="http://www.w3.org/2000/svg" className={`h-5 w-5 transition-transform text-gray-400 ${!isPinnedCollapsed ? 'rotate-180' : ''}`} viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" /></svg>
+                        </button>
+                        {!isPinnedCollapsed && (
+                          <>
+                            <div className="flex justify-end px-3 py-2 bg-gray-50 dark:bg-gray-700/30 border-t border-gray-200 dark:border-gray-700">
+                              <button
+                                  onClick={() => setIsPinnedReorderMode(!isPinnedReorderMode)}
+                                  className="px-2 py-1 text-xs font-semibold text-white bg-blue-500 rounded-md hover:bg-blue-600"
+                              >
+                                  {isPinnedReorderMode ? 'Done' : 'Reorder'}
+                              </button>
+                            </div>
                            <ul className="divide-y divide-gray-200 dark:divide-gray-700">
                                 {pinnedPeople.map((p, index) => (
                                     <SwipeableListItem 
@@ -813,7 +1651,8 @@ function App() {
                                     </SwipeableListItem>
                                 ))}
                             </ul>
-                        </div>
+                          </>
+                        )}
                     </div>
                  )}
 
@@ -864,7 +1703,7 @@ function App() {
              <section>
                  <div className="flex justify-between items-center mb-4">
                     <h2 className="text-xl font-semibold">All Groups</h2>
-                    <button onClick={() => setActiveModal('add-group')} className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 text-sm">Add Group</button>
+                    <button data-tour="add-group" onClick={() => setActiveModal('add-group')} className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 text-sm">Add Group</button>
                  </div>
                  <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
                     <ul className="divide-y divide-gray-200 dark:divide-gray-700">
@@ -908,11 +1747,11 @@ function App() {
             <section>
                  <div className="flex justify-between items-center mb-4">
                     <h2 className="text-xl font-semibold">Planned Activities</h2>
-                    <button onClick={() => setActiveModal('plan-activity')} className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 text-sm">Plan Activity</button>
+                    <button data-tour="plan-activity" onClick={() => setActiveModal('plan-activity')} className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 text-sm">Plan Activity</button>
                  </div>
                  <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
                     <ul className="divide-y divide-gray-200 dark:divide-gray-700">
-                    {[...activities].sort((a, b) => (a.date && b.date) ? new Date(a.date).getTime() - new Date(b.date).getTime() : a.date ? -1 : 1).map(a => (
+                    {[...activities].sort((a, b) => (a.date && b.date) ? parseLocalDate(a.date).getTime() - parseLocalDate(b.date).getTime() : a.date ? -1 : 1).map(a => (
                         <SwipeableListItem
                             key={a.id}
                             onItemClick={() => { setEditingActivity(a); setActiveModal('edit-activity'); }}
@@ -928,9 +1767,9 @@ function App() {
                                 <div className="flex justify-between items-start">
                                     <div>
                                         <h3 className="font-bold">{a.title}</h3>
-                                        <p className="font-normal text-sm text-gray-500 dark:text-gray-400">
-                                            {a.date ? new Date(a.date).toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : <span className="italic">Date TBD</span>}
-                                        </p>
+                    <p className="font-normal text-sm text-gray-500 dark:text-gray-400">
+                      {a.date ? formatLongDate(parseLocalDate(a.date)) : <span className="italic">Date TBD</span>}
+                    </p>
                                     </div>
                                     {a.date && (
                                         <a href={generateCalendarLink(a)} onPointerDown={(e) => e.stopPropagation()} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:text-blue-600" aria-label="Add to calendar">
@@ -1007,6 +1846,7 @@ function App() {
 
       <button 
         aria-label="Log a Connection"
+        data-tour="log-fab"
         onClick={() => setActiveModal('log-interaction')} 
         className="fixed bottom-28 sm:bottom-6 left-6 bg-green-600 text-white rounded-full p-3.5 shadow-lg hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 dark:focus:ring-offset-gray-900 z-10"
       >
@@ -1025,9 +1865,389 @@ function App() {
         </button>
       )}
 
+      {/* Share Selection Modal */}
+      {sharingCard && meProfile && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-gray-800 w-full max-w-md rounded-lg shadow-xl">
+            <div className="p-6">
+              <h2 className="text-xl font-semibold mb-4">Share Your Card</h2>
+              <p className="text-sm text-gray-600 dark:text-gray-400 mb-6">
+                Choose what to share:
+              </p>
+              
+              <div className="space-y-3 mb-6">
+                {meProfile.interests.length > 0 && (
+                  <label className="flex items-center gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={sharingCard.interests}
+                      onChange={(e) => setSharingCard({ ...sharingCard, interests: e.target.checked })}
+                    />
+                    <div className="flex-1">
+                      <p className="font-medium">Interests</p>
+                      <p className="text-sm text-gray-500 dark:text-gray-400">{meProfile.interests.join(', ')}</p>
+                    </div>
+                  </label>
+                )}
+                {meProfile.dislikes.length > 0 && (
+                  <label className="flex items-center gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={sharingCard.dislikes}
+                      onChange={(e) => setSharingCard({ ...sharingCard, dislikes: e.target.checked })}
+                    />
+                    <div className="flex-1">
+                      <p className="font-medium">Dislikes</p>
+                      <p className="text-sm text-gray-500 dark:text-gray-400">{meProfile.dislikes.join(', ')}</p>
+                    </div>
+                  </label>
+                )}
+                {meProfile.birthdate && (
+                  <label className="flex items-center gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={sharingCard.birthdate}
+                      onChange={(e) => setSharingCard({ ...sharingCard, birthdate: e.target.checked })}
+                    />
+                    <div className="flex-1">
+                      <p className="font-medium">Birthday</p>
+                      <p className="text-sm text-gray-500 dark:text-gray-400">{formatBirthdateDisplay(meProfile.birthdate)}</p>
+                    </div>
+                  </label>
+                )}
+                {meProfile.giftIdeas && meProfile.giftIdeas.length > 0 && (
+                  <label className="flex items-center gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={sharingCard.giftIdeas}
+                      onChange={(e) => setSharingCard({ ...sharingCard, giftIdeas: e.target.checked })}
+                    />
+                    <div className="flex-1">
+                      <p className="font-medium">Gift Ideas</p>
+                      <p className="text-sm text-gray-500 dark:text-gray-400">{meProfile.giftIdeas.length} ideas</p>
+                    </div>
+                  </label>
+                )}
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={handleConfirmShare}
+                  className="flex-1 bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md font-medium"
+                >
+                  Share Selected
+                </button>
+                <button
+                  onClick={() => setSharingCard(null)}
+                  className="flex-1 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-800 dark:text-gray-100 px-4 py-2 rounded-md font-medium"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Manual Merge Person Selection Modal */}
+      {manualMergeCard && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-gray-800 w-full max-w-md rounded-lg shadow-xl max-h-[90vh] overflow-y-auto">
+            <div className="p-6">
+              <h2 className="text-xl font-semibold mb-4">Select Person to Merge With</h2>
+              <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+                Merging card for: <span className="font-semibold">{manualMergeCard.name}</span>
+              </p>
+              
+              <div className="space-y-2 mb-6">
+                {otherPeople.sort((a, b) => a.name.localeCompare(b.name)).map(person => (
+                  <button
+                    key={person.id}
+                    onClick={() => handleSelectPersonForMerge(person.id)}
+                    className="w-full text-left p-3 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                  >
+                    <p className="font-medium">{person.name}</p>
+                    {person.circles.length > 0 && (
+                      <p className="text-sm text-gray-500 dark:text-gray-400">{person.circles.join(', ')}</p>
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              <button
+                onClick={() => setManualMergeCard(null)}
+                className="w-full bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-800 dark:text-gray-100 px-4 py-2 rounded-md font-medium"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Import Card Preview Modal */}
+      {importingCard && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-gray-800 w-full max-w-md rounded-lg shadow-xl">
+            <div className="p-6">
+              <h2 className="text-xl font-semibold mb-4">Import Contact</h2>
+              <div className="space-y-3 mb-6">
+                <div>
+                  <p className="text-sm font-medium text-gray-500 dark:text-gray-400">Name</p>
+                  <p className="font-semibold">{importingCard.name}</p>
+                </div>
+                {importingCard.birthdate && (
+                  <div>
+                    <p className="text-sm font-medium text-gray-500 dark:text-gray-400">Birthday</p>
+                    <p>{formatBirthdateDisplay(importingCard.birthdate)}</p>
+                  </div>
+                )}
+                {importingCard.interests.length > 0 && (
+                  <div>
+                    <p className="text-sm font-medium text-gray-500 dark:text-gray-400">Interests</p>
+                    <p className="text-sm">{importingCard.interests.join(', ')}</p>
+                  </div>
+                )}
+                {importingCard.dislikes.length > 0 && (
+                  <div>
+                    <p className="text-sm font-medium text-gray-500 dark:text-gray-400">Dislikes</p>
+                    <p className="text-sm">{importingCard.dislikes.join(', ')}</p>
+                  </div>
+                )}
+                {importingCard.giftIdeas && importingCard.giftIdeas.length > 0 && (
+                  <div>
+                    <p className="text-sm font-medium text-gray-500 dark:text-gray-400">Gift Ideas</p>
+                    <ul className="text-sm list-disc list-inside">
+                      {importingCard.giftIdeas.map((idea, i) => (
+                        <li key={i}>{idea.text}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+              <div className="flex gap-3">
+                <button
+                  onClick={handleConfirmImport}
+                  className="flex-1 bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-md font-medium"
+                >
+                  Import as New
+                </button>
+                <button
+                  onClick={handleManualMerge}
+                  className="flex-1 bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md font-medium"
+                >
+                  Merge with...
+                </button>
+              </div>
+              <button
+                onClick={() => setImportingCard(null)}
+                className="w-full mt-3 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-800 dark:text-gray-100 px-4 py-2 rounded-md font-medium"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Merge Card Dialog Modal */}
+      {mergingCard && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-gray-800 w-full max-w-2xl rounded-lg shadow-xl max-h-[90vh] overflow-y-auto">
+            <div className="p-6">
+              <h2 className="text-xl font-semibold mb-2">Merge Contact Updates</h2>
+              <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">
+                Merging <span className="font-semibold">{mergingCard.card.name}</span>'s card into <span className="font-semibold">{mergingCard.existingPerson.name}</span>
+              </p>
+              <p className="text-sm text-gray-600 dark:text-gray-400 mb-6">
+                Select which fields to update:
+              </p>
+              
+              <div className="space-y-4 mb-6">
+                {/* Interests */}
+                {mergingCard.card.interests.length > 0 && (
+                  <label className="flex items-start gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={mergingCard.mergeOptions.interests}
+                      onChange={(e) => setMergingCard({
+                        ...mergingCard,
+                        mergeOptions: { ...mergingCard.mergeOptions, interests: e.target.checked }
+                      })}
+                      className="mt-1"
+                    />
+                    <div className="flex-1">
+                      <p className="font-medium mb-1">Interests</p>
+                      <div className="grid grid-cols-2 gap-2 text-sm">
+                        <div>
+                          <p className="text-gray-500 dark:text-gray-400">Current:</p>
+                          <p>{mergingCard.existingPerson.interests.length > 0 ? mergingCard.existingPerson.interests.join(', ') : 'None'}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-500 dark:text-gray-400">New:</p>
+                          <p>{mergingCard.card.interests.join(', ')}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </label>
+                )}
+
+                {/* Dislikes */}
+                {mergingCard.card.dislikes.length > 0 && (
+                  <label className="flex items-start gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={mergingCard.mergeOptions.dislikes}
+                      onChange={(e) => setMergingCard({
+                        ...mergingCard,
+                        mergeOptions: { ...mergingCard.mergeOptions, dislikes: e.target.checked }
+                      })}
+                      className="mt-1"
+                    />
+                    <div className="flex-1">
+                      <p className="font-medium mb-1">Dislikes</p>
+                      <div className="grid grid-cols-2 gap-2 text-sm">
+                        <div>
+                          <p className="text-gray-500 dark:text-gray-400">Current:</p>
+                          <p>{mergingCard.existingPerson.dislikes.length > 0 ? mergingCard.existingPerson.dislikes.join(', ') : 'None'}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-500 dark:text-gray-400">New:</p>
+                          <p>{mergingCard.card.dislikes.join(', ')}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </label>
+                )}
+
+                {/* Birthdate */}
+                {mergingCard.card.birthdate && (
+                  <label className="flex items-start gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={mergingCard.mergeOptions.birthdate}
+                      onChange={(e) => setMergingCard({
+                        ...mergingCard,
+                        mergeOptions: { ...mergingCard.mergeOptions, birthdate: e.target.checked }
+                      })}
+                      className="mt-1"
+                    />
+                    <div className="flex-1">
+                      <p className="font-medium mb-1">Birthday</p>
+                      <div className="grid grid-cols-2 gap-2 text-sm">
+                        <div>
+                          <p className="text-gray-500 dark:text-gray-400">Current:</p>
+                          <p>{mergingCard.existingPerson.birthdate ? formatBirthdateDisplay(mergingCard.existingPerson.birthdate) : 'None'}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-500 dark:text-gray-400">New:</p>
+                          <p>{formatBirthdateDisplay(mergingCard.card.birthdate)}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </label>
+                )}
+
+                {/* Gift Ideas */}
+                {mergingCard.card.giftIdeas && mergingCard.card.giftIdeas.length > 0 && (
+                  <label className="flex items-start gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={mergingCard.mergeOptions.giftIdeas}
+                      onChange={(e) => setMergingCard({
+                        ...mergingCard,
+                        mergeOptions: { ...mergingCard.mergeOptions, giftIdeas: e.target.checked }
+                      })}
+                      className="mt-1"
+                    />
+                    <div className="flex-1">
+                      <p className="font-medium mb-1">Gift Ideas</p>
+                      <div className="grid grid-cols-2 gap-2 text-sm">
+                        <div>
+                          <p className="text-gray-500 dark:text-gray-400">Current:</p>
+                          <ul className="list-disc list-inside">
+                            {mergingCard.existingPerson.giftIdeas?.length > 0 ? mergingCard.existingPerson.giftIdeas.map((g, i) => (
+                              <li key={i}>{g.text}</li>
+                            )) : <li>None</li>}
+                          </ul>
+                        </div>
+                        <div>
+                          <p className="text-gray-500 dark:text-gray-400">New:</p>
+                          <ul className="list-disc list-inside">
+                            {mergingCard.card.giftIdeas.map((g, i) => (
+                              <li key={i}>{g.text}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    </div>
+                  </label>
+                )}
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => handleConfirmMerge(mergingCard.mergeOptions)}
+                  className="flex-1 bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md font-medium"
+                >
+                  Merge Selected
+                </button>
+                <button
+                  onClick={() => setMergingCard(null)}
+                  className="flex-1 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-800 dark:text-gray-100 px-4 py-2 rounded-md font-medium"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <Modal isOpen={!!activeModal} onClose={handleModalClose} title={title}>
         {content}
       </Modal>
+
+      {/* Onboarding Tour Overlay */}
+      <OnboardingController />
+
+      {/* Manual Share Overlay */}
+      {manualShareLink && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => setManualShareLink(null)}>
+          <div className="bg-white dark:bg-gray-800 w-full max-w-md rounded-lg shadow-xl p-5" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-lg font-semibold mb-2">Copy Link</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Tap the field below to copy the link manually.</p>
+            <input
+              readOnly
+              value={manualShareLink}
+              onFocus={(e) => { e.currentTarget.select(); }}
+              className="w-full input-field"
+            />
+            <div className="mt-4 flex gap-2">
+              <button
+                className="flex-1 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-800 dark:text-gray-100 px-4 py-2 rounded-md font-medium"
+                onClick={async () => { try { await Clipboard.write({ string: manualShareLink }); setShowToast('Link copied!'); setTimeout(()=>setShowToast(null), 2000);} catch {} }}
+              >Copy</button>
+              <button
+                className="flex-1 bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md font-medium"
+                onClick={() => setManualShareLink(null)}
+              >Done</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Notification */}
+      {showToast && (
+        <div className="fixed bottom-20 left-1/2 transform -translate-x-1/2 z-50 animate-fade-in-up">
+          <div className="bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 px-6 py-3 rounded-lg shadow-lg flex items-center gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-green-400 dark:text-green-600" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+            </svg>
+            <span className="font-medium">{showToast}</span>
+          </div>
+        </div>
+      )}
 
     </div>
   );
