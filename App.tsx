@@ -346,16 +346,20 @@ function App() {
   };
 
   const handleQuickLog = (itemId: string, itemType: 'person' | 'group') => {
-    const today = new Date().toISOString();
-    const interaction: Interaction = {
-        id: Date.now().toString(),
-        date: today.split('T')[0],
-        type: 'Check-in',
-        notes: 'Quick check-in.',
-        personIds: itemType === 'person' ? [itemId] : [],
-        groupIds: itemType === 'group' ? [itemId] : [],
-    };
-    handleSaveInteraction(interaction, false); 
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm = String(today.getMonth() + 1).padStart(2, '0');
+  const dd = String(today.getDate()).padStart(2, '0');
+  const localDate = `${yyyy}-${mm}-${dd}`;
+  const interaction: Interaction = {
+    id: Date.now().toString(),
+    date: localDate,
+    type: 'Check-in',
+    notes: 'Quick check-in.',
+    personIds: itemType === 'person' ? [itemId] : [],
+    groupIds: itemType === 'group' ? [itemId] : [],
+  };
+  handleSaveInteraction(interaction, false); 
   };
   
   const handleOpenDetailedLog = (id: string, name: string, type: 'person' | 'group') => {

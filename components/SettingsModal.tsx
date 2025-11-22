@@ -85,6 +85,50 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
   const [connectionTypesExpanded, setConnectionTypesExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
+
+  // Manual Push to Cloud
+  const handlePushToCloud = async () => {
+    setLoading(true);
+    setError(null);
+    setSyncMessage(null);
+    const uid = auth.currentUser?.uid;
+    if (!uid) {
+      setError('Please sign in to sync data.');
+      setLoading(false);
+      return;
+    }
+    try {
+      await migrateLocalToCloud(uid);
+      setSyncMessage('Local data pushed to cloud!');
+    } catch (e) {
+      setError('Failed to push data to cloud.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Manual Pull from Cloud
+  const handlePullFromCloud = async () => {
+    setLoading(true);
+    setError(null);
+    setSyncMessage(null);
+    const uid = auth.currentUser?.uid;
+    if (!uid) {
+      setError('Please sign in to sync data.');
+      setLoading(false);
+      return;
+    }
+    try {
+      await pullRemoteToLocal(uid);
+      setSyncMessage('Cloud data pulled to device!');
+      window.location.reload();
+    } catch (e) {
+      setError('Failed to pull data from cloud.');
+    } finally {
+      setLoading(false);
+    }
+  };
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleResetData = async () => {
@@ -384,24 +428,51 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
           <button
             onClick={handleResetData}
             className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 text-sm font-medium w-full"
+            disabled={loading}
           >
-            Reset All Data
+            {loading ? 'Processing...' : 'Reset All Data'}
           </button>
 
-          <div className="flex space-x-2">
+          <div className="flex flex-col gap-2 sm:flex-row sm:gap-2">
             <button
               onClick={handleExport}
               className="px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 text-sm flex-1"
+              disabled={loading}
             >
               Export All Data
             </button>
             <button
               onClick={handleImportClick}
               className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 text-sm flex-1"
+              disabled={loading}
             >
               Import Data
             </button>
           </div>
+
+          <div className="flex flex-col gap-2 sm:flex-row sm:gap-2 pt-2">
+            <button
+              onClick={handlePushToCloud}
+              className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 text-sm flex-1"
+              disabled={loading}
+            >
+              Push Local Data to Cloud
+            </button>
+            <button
+              onClick={handlePullFromCloud}
+              className="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 text-sm flex-1"
+              disabled={loading}
+            >
+              Pull Data from Cloud
+            </button>
+          </div>
+
+          {(error || syncMessage) && (
+            <div className="pt-2">
+              {error && <div className="text-red-600 text-sm">{error}</div>}
+              {syncMessage && <div className="text-green-600 text-sm">{syncMessage}</div>}
+            </div>
+          )}
         </div>
         <input
           type="file"
