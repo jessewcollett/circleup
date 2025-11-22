@@ -26,3 +26,7 @@ dist-ssr
 # Environment variable files
 .env
 .env.*
+
+# Ignore sensitive mobile config files
+android/google-services.json
+ios/App/App/GoogleService-Info*.plist
