@@ -7,16 +7,15 @@ import { getFirestore, enableIndexedDbPersistence } from 'firebase/firestore';
 // https://firebase.google.com/docs/web/setup#available-libraries
 import { getMessaging, getToken, onMessage } from "firebase/messaging";
 
-// Your web app's Firebase configuration
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+// Firebase config is now loaded from environment variables for security
 const firebaseConfig = {
-  apiKey: "AIzaSyAccWig5OsxOjK-MykqrGdX1pZjpZhWdx8",
-  authDomain: "circleup-bdd94.firebaseapp.com",
-  projectId: "circleup-bdd94",
-  storageBucket: "circleup-bdd94.firebasestorage.app",
-  messagingSenderId: "1031944311075",
-  appId: "1:1031944311075:web:b0c0469bceb6be85987c96",
-  measurementId: "G-8QQS4HFJHL"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
 
 // Initialize Firebase
