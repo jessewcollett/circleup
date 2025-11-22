@@ -3,14 +3,15 @@ importScripts('https://www.gstatic.com/firebasejs/10.11.0/firebase-app-compat.js
 importScripts('https://www.gstatic.com/firebasejs/10.11.0/firebase-messaging-compat.js');
 
 // For Firebase JS SDK v7.20.0 and later, measurementId is optional
+// Firebase config is injected at build time for security
 const firebaseConfig = {
-  apiKey: "AIzaSyAccWig5OsxOjK-MykqrGdX1pZjpZhWdx8",
-  authDomain: "circleup-bdd94.firebaseapp.com",
-  projectId: "circleup-bdd94",
-  storageBucket: "circleup-bdd94.firebasestorage.app",
-  messagingSenderId: "1031944311075",
-  appId: "1:1031944311075:web:b0c0469bceb6be85987c96",
-  measurementId: "G-8QQS4HFJHL"
+  apiKey: self.FIREBASE_API_KEY,
+  authDomain: self.FIREBASE_AUTH_DOMAIN,
+  projectId: self.FIREBASE_PROJECT_ID,
+  storageBucket: self.FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: self.FIREBASE_MESSAGING_SENDER_ID,
+  appId: self.FIREBASE_APP_ID,
+  measurementId: self.FIREBASE_MEASUREMENT_ID
 };
 
 
