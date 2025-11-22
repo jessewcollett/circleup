@@ -30,9 +30,10 @@ export const auth = isNative
   ? initializeAuth(app, { persistence: inMemoryPersistence })
   : getAuth(app);
 export const db = getFirestore(app);
-// Initialize Firebase Messaging for PWA push notifications
-export const messaging = getMessaging(app);
-export { getToken, onMessage };
+// Initialize Firebase Messaging for PWA push notifications (web only)
+export const messaging = !isNative ? getMessaging(app) : undefined;
+export const getTokenIfWeb = !isNative ? getToken : undefined;
+export const onMessageIfWeb = !isNative ? onMessage : undefined;
 
 // Try to enable IndexedDB persistence for offline support; ignore errors if not possible
 enableIndexedDbPersistence(db).catch((err) => {

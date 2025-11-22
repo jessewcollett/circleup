@@ -1,0 +1,11 @@
+{
+  "appId": "com.circleupco.app",
+  "appName": "CircleUp",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "plugins": {
+    "GoogleAuth": {
+      "iosClientId": "1031944311075-qiv3h3s676q6t1skpj1ekuraqkpnptjr.apps.googleusercontent.com"
+    }
+  }
+}
