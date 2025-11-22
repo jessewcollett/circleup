@@ -24,12 +24,5 @@ if (
   'serviceWorker' in navigator &&
   !(window as any).Capacitor?.isNativePlatform?.()
 ) {
-  // Register Firebase Messaging service worker for PWA push notifications
-  navigator.serviceWorker.register('/firebase-messaging-sw.js')
-    .then((registration) => {
-      console.log('[FCM] Service worker registered:', registration);
-    })
-    .catch((error) => {
-      console.error('[FCM] Service worker registration failed:', error);
-    });
+   // Push notifications are disabled for now
 }

@@ -4,8 +4,27 @@
   --sab: env(safe-area-inset-bottom);
 }
 
+
 .safe-top {
   padding-top: var(--sat);
+}
+
+header.sticky.top-0 {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  width: 100vw;
+  left: 0;
+  right: 0;
+}
+
+@media (max-width: 640px) {
+  header.sticky.top-0 {
+    left: 0;
+    right: 0;
+    width: 100vw;
+    min-width: 0;
+  }
 }
 
 .safe-bottom {

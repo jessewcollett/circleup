@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { signOut } from 'firebase/auth';
-import { auth, db, messaging, getTokenIfWeb } from '../firebase';
+import { auth, db } from '../firebase';
 import { migrateLocalToCloud, pullRemoteToLocal } from '../lib/firestoreSync';
 import { testFirestore } from '../lib/firestoreTest';
 import { collection, query, getDocs, writeBatch, deleteDoc, doc } from 'firebase/firestore';
@@ -76,61 +76,7 @@ const ReorderableList: React.FC<{
 }
 
 const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, connectionTypes, setConnectionTypes, reminderLookahead, setReminderLookahead, onClose, onManualSync, lastSyncAt, onReplayTour }) => {
-  const [notificationsEnabled, setNotificationsEnabled] = useState(false);
-  const [notificationLoading, setNotificationLoading] = useState(false);
 
-  const handleNotificationToggle = async () => {
-    if (!notificationsEnabled) {
-      setNotificationLoading(true);
-      try {
-        // Request notification permission when toggled on
-        const permission = await Notification.requestPermission();
-        if (permission === 'granted') {
-          // Get FCM token
-          if (messaging && getTokenIfWeb) {
-            const uid = auth.currentUser?.uid;
-            if (!uid) {
-              alert('You must be signed in to enable notifications.');
-              setNotificationLoading(false);
-              return;
-            }
-            // VAPID key should be set in Firebase Console > Project Settings > Cloud Messaging
-            // Optionally, you can provide it here for getToken
-            const vapidKey = undefined; // e.g. 'YOUR_PUBLIC_VAPID_KEY_HERE'
-            try {
-              const token = await getTokenIfWeb(messaging, { vapidKey, serviceWorkerRegistration: undefined });
-              if (token) {
-                // Save token to Firestore under user doc
-                await import('firebase/firestore').then(async ({ doc, setDoc }) => {
-                  await setDoc(doc(db, 'users', uid, 'meta', 'fcm'), { token }, { merge: true });
-                });
-                setNotificationsEnabled(true);
-                alert('Notifications enabled!');
-              } else {
-                setNotificationsEnabled(false);
-                alert('Failed to get FCM token. Please try again.');
-              }
-            } catch (err) {
-              setNotificationsEnabled(false);
-              alert('Error getting FCM token: ' + (err as any)?.message);
-            }
-          } else {
-            setNotificationsEnabled(false);
-            alert('Push notifications are only available in the web app.');
-          }
-        } else {
-          setNotificationsEnabled(false);
-          alert('Notifications permission was denied.');
-        }
-      } finally {
-        setNotificationLoading(false);
-      }
-    } else {
-      setNotificationsEnabled(false);
-      // Optionally: Remove FCM token from Firestore if disabling
-      // (not implemented here)
-    }
-  };
   const [newCircle, setNewCircle] = useState('');
   const [newConnectionType, setNewConnectionType] = useState('');
   const [isCirclesReorderMode, setIsCirclesReorderMode] = useState(false);
@@ -331,7 +277,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
             <span>30 days</span>
           </div>
         </div>
-      </div>
+
 
       <div className="border-t border-gray-200 dark:border-gray-700 pt-6">
         <button
@@ -429,28 +375,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
         )}
       </div>
 
-      <div className="border-t border-gray-200 dark:border-gray-700 pt-6 mt-6">
-      <div className="border-t border-gray-200 dark:border-gray-700 pt-6 mt-6">
-        <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Notifications</h3>
-        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">Enable push notifications for reminders and updates.</p>
-        <div className="pt-4">
-          <label className="flex items-center gap-3 cursor-pointer select-none">
-            <span className="text-sm font-medium">Enable Notifications</span>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={notificationsEnabled}
-              onClick={handleNotificationToggle}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${notificationsEnabled ? 'bg-blue-600' : 'bg-gray-300'} ${notificationLoading ? 'opacity-60 cursor-not-allowed' : ''}`}
-              disabled={notificationLoading}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform duration-200 ${notificationsEnabled ? 'translate-x-5' : 'translate-x-1'}`}
-              />
-            </button>
-          </label>
-        </div>
-      </div>
+
         <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100">Data Management</h3>
         <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
           Manage your app data, including backup, restore, and reset options.
@@ -532,10 +457,9 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
           </button>
         </div>
       </div>
-
-       {/* Global .input-field styles now centralized in index.css */}
     </div>
   );
+// Global .input-field styles now centralized in index.css
 };
 
 export default SettingsModal;

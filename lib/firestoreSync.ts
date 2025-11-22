@@ -114,6 +114,38 @@ export async function pullRemoteToLocal(uid: string) {
       localStorage.setItem(LS_KEYS[col as keyof typeof LS_KEYS], JSON.stringify(items));
     } catch (e) {}
   }
+
+  // --- Recalculate lastConnection for people and groups based on synced interactions ---
+  const people = result.people || [];
+  const groups = result.groups || [];
+  const interactions = result.interactions || [];
+  // Helper: get latest date for a person/group from interactions
+  function getLatestConnectionDateForPerson(personId: string) {
+    const relevant = interactions.filter((i: any) => i.personIds && i.personIds.includes(personId));
+    if (relevant.length === 0) return undefined;
+    return relevant.map((i: any) => i.date).sort().reverse()[0];
+  }
+  function getLatestConnectionDateForGroup(groupId: string) {
+    const relevant = interactions.filter((i: any) => i.groupIds && i.groupIds.includes(groupId));
+    if (relevant.length === 0) return undefined;
+    return relevant.map((i: any) => i.date).sort().reverse()[0];
+  }
+  // Update people
+  const updatedPeople = people.map((p: any) => {
+    const latest = getLatestConnectionDateForPerson(p.id);
+    return latest ? { ...p, lastConnection: latest } : p;
+  });
+  const updatedGroups = groups.map((g: any) => {
+    const latest = getLatestConnectionDateForGroup(g.id);
+    return latest ? { ...g, lastConnection: latest } : g;
+  });
+  try {
+    localStorage.setItem(LS_KEYS.people, JSON.stringify(updatedPeople));
+    localStorage.setItem(LS_KEYS.groups, JSON.stringify(updatedGroups));
+  } catch (e) {}
+  result.people = updatedPeople;
+  result.groups = updatedGroups;
+
   // settings
   try {
     const settingsDoc = doc(db, 'users', uid, 'meta', 'settings');

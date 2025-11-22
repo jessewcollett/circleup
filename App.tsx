@@ -1382,8 +1382,8 @@ function App() {
           </div>
         </div>
       )}
-      <header className="bg-white dark:bg-gray-800 shadow-sm sticky top-0 z-20 safe-top">
-        <div className="container mx-auto px-4 py-3 flex justify-between items-center">
+      <header className="bg-white dark:bg-gray-800 shadow-sm fixed top-0 left-0 w-full z-50 safe-top">
+        <div className="px-4 py-3 flex justify-between items-center max-w-4xl mx-auto">
             <h1 className="text-2xl font-bold text-gray-800 dark:text-gray-100">CircleUp</h1>
             <div className="flex items-center space-x-2 sm:space-x-4">
                 <button onClick={() => setActiveModal('ai-generator')} className="p-2 sm:px-3 sm:py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 flex items-center space-x-2 text-sm">
@@ -1416,7 +1416,7 @@ function App() {
         </nav>
       </header>
       
-      <main className="container mx-auto p-4 pb-40 sm:pb-4">
+  <main className="container mx-auto p-4 pb-40 sm:pb-4 pt-20">
         {activeTab === 'dashboard' && (
              <div className="space-y-6">
                 <section>

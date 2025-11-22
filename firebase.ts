@@ -5,7 +5,7 @@ import { initializeAuth, browserLocalPersistence, inMemoryPersistence, getAuth }
 import { getFirestore, enableIndexedDbPersistence } from 'firebase/firestore';
 // TODO: Add SDKs for Firebase products that you want to use
 // https://firebase.google.com/docs/web/setup#available-libraries
-import { getMessaging, getToken, onMessage } from "firebase/messaging";
+// import { getMessaging, getToken, onMessage } from "firebase/messaging";
 
 // Firebase config is now loaded from environment variables for security
 const firebaseConfig = {
@@ -29,10 +29,7 @@ export const auth = isNative
   ? initializeAuth(app, { persistence: inMemoryPersistence })
   : getAuth(app);
 export const db = getFirestore(app);
-// Initialize Firebase Messaging for PWA push notifications (web only)
-export const messaging = !isNative ? getMessaging(app) : undefined;
-export const getTokenIfWeb = !isNative ? getToken : undefined;
-export const onMessageIfWeb = !isNative ? onMessage : undefined;
+// Push notifications are disabled for now
 
 // Try to enable IndexedDB persistence for offline support; ignore errors if not possible
 enableIndexedDbPersistence(db).catch((err) => {
