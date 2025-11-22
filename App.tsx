@@ -191,9 +191,9 @@ function App() {
 
         if (user && !user.isAnonymous) {
           try {
-            await migrateLocalToCloud(user.uid);
+            await pullRemoteToLocal(user.uid);
           } catch (err) {
-            console.error('Error migrating local data to cloud:', err);
+            console.error('Error pulling remote data to local:', err);
           }
 
           // Start realtime listeners that will update localStorage and React state

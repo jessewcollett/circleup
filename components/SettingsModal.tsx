@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { signOut } from 'firebase/auth';
-import { auth, db } from '../firebase';
+import { auth, db, messaging, getTokenIfWeb } from '../firebase';
 import { migrateLocalToCloud, pullRemoteToLocal } from '../lib/firestoreSync';
 import { testFirestore } from '../lib/firestoreTest';
 import { collection, query, getDocs, writeBatch, deleteDoc, doc } from 'firebase/firestore';
@@ -77,21 +77,58 @@ const ReorderableList: React.FC<{
 
 const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, connectionTypes, setConnectionTypes, reminderLookahead, setReminderLookahead, onClose, onManualSync, lastSyncAt, onReplayTour }) => {
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+  const [notificationLoading, setNotificationLoading] = useState(false);
 
   const handleNotificationToggle = async () => {
     if (!notificationsEnabled) {
-      // Request notification permission when toggled on
-      const permission = await Notification.requestPermission();
-      if (permission === 'granted') {
-        setNotificationsEnabled(true);
-        // Optionally trigger token registration logic here
-      } else {
-        setNotificationsEnabled(false);
-        alert('Notifications permission was denied.');
+      setNotificationLoading(true);
+      try {
+        // Request notification permission when toggled on
+        const permission = await Notification.requestPermission();
+        if (permission === 'granted') {
+          // Get FCM token
+          if (messaging && getTokenIfWeb) {
+            const uid = auth.currentUser?.uid;
+            if (!uid) {
+              alert('You must be signed in to enable notifications.');
+              setNotificationLoading(false);
+              return;
+            }
+            // VAPID key should be set in Firebase Console > Project Settings > Cloud Messaging
+            // Optionally, you can provide it here for getToken
+            const vapidKey = undefined; // e.g. 'YOUR_PUBLIC_VAPID_KEY_HERE'
+            try {
+              const token = await getTokenIfWeb(messaging, { vapidKey, serviceWorkerRegistration: undefined });
+              if (token) {
+                // Save token to Firestore under user doc
+                await import('firebase/firestore').then(async ({ doc, setDoc }) => {
+                  await setDoc(doc(db, 'users', uid, 'meta', 'fcm'), { token }, { merge: true });
+                });
+                setNotificationsEnabled(true);
+                alert('Notifications enabled!');
+              } else {
+                setNotificationsEnabled(false);
+                alert('Failed to get FCM token. Please try again.');
+              }
+            } catch (err) {
+              setNotificationsEnabled(false);
+              alert('Error getting FCM token: ' + (err as any)?.message);
+            }
+          } else {
+            setNotificationsEnabled(false);
+            alert('Push notifications are only available in the web app.');
+          }
+        } else {
+          setNotificationsEnabled(false);
+          alert('Notifications permission was denied.');
+        }
+      } finally {
+        setNotificationLoading(false);
       }
     } else {
       setNotificationsEnabled(false);
-      // Optionally handle disabling notifications
+      // Optionally: Remove FCM token from Firestore if disabling
+      // (not implemented here)
     }
   };
   const [newCircle, setNewCircle] = useState('');
@@ -404,7 +441,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ circles, setCircles, conn
               role="switch"
               aria-checked={notificationsEnabled}
               onClick={handleNotificationToggle}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${notificationsEnabled ? 'bg-blue-600' : 'bg-gray-300'}`}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${notificationsEnabled ? 'bg-blue-600' : 'bg-gray-300'} ${notificationLoading ? 'opacity-60 cursor-not-allowed' : ''}`}
+              disabled={notificationLoading}
             >
               <span
                 className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform duration-200 ${notificationsEnabled ? 'translate-x-5' : 'translate-x-1'}`}
