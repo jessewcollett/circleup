@@ -1,3 +1,16 @@
+html, body, #root {
+  min-height: 100vh;
+  height: 100%;
+  width: 100vw;
+  background-color: #1F2937 !important;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background-color: inherit;
+}
 html, body {
   background-color: #1F2937 !important; /* dark bg always */
   overscroll-behavior: none;
