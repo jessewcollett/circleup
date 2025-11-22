@@ -17,3 +17,14 @@ root.render(
   </React.StrictMode>
 );
 console.log('[bootstrap] React render called');
+
+// Prevent service worker registration in native (Capacitor) environments
+if (
+  typeof window !== 'undefined' &&
+  'serviceWorker' in navigator &&
+  !(window as any).Capacitor?.isNativePlatform?.()
+) {
+  // Place your service worker registration here if needed for web/PWA
+  // Example:
+  // navigator.serviceWorker.register('/sw.js');
+}
